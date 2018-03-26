@@ -1,0 +1,466 @@
+
+
+/***************************************************************************************************
+Script read the error log and return information, excluding some noise.
+Will go back in time and read as many error logs needed to fulfill hoursBack param
+
+2018-02-04		S.Simon		Added comments because i couldn't remember original date
+2018-03-12		S.Simon		Added explicit log text search parameter, subject parameter, null logic
+***************************************************************************************************/
+
+create procedure [dbo].[usp_error_log](
+									@emailResults bit = 0							--1 sends an email to @email or @operator. @operator overrides @email
+									,@operator varchar(256) = null					--name of operator set up in DB. Will find email for this operator
+									,@email varchar(256) = null						--email address you want results sent to
+									,@hoursBack int = null							--number of hours back you want to check  the error log. Searches last two error logs
+									,@logTextExclusionsStr varchar(max) = null		--semicolon seperated string of log text exclusions
+									,@logTextExplicitSearchStr varchar(max) = null	--semicolon seperated string of explicit text to search for (overrides exclusions)
+									,@processInfoExclusionsStr varchar(max) = null	--semicolon seperated string of process info exclusions
+									,@mailProfile varchar(256) = null				--used in sp_send_dbmail
+									,@subject varchar(1024) = null
+									)
+as
+
+
+
+-------------------------------------------------------------------------------------
+------proc parameters for testing
+-------------------------------------------------------------------------------------
+--declare @emailResults bit = 1
+--declare @operator varchar(256) = null
+--declare @email varchar(256) = 'yourMom@domain.com'
+--declare @hoursBack int = 24
+--declare @logTextExclusionsStr varchar(max) = ('backup database successfully;Log was backed up')
+--declare @logTextExplicitSearchStr varchar(max) = null 
+--declare @processInfoExclusionsStr varchar(max) = ('logon')
+--declare @mailProfile varchar(256) = null
+--declare @subject varchar(1024) = 'Error Log Report'
+
+
+
+
+---------------------------------------------------------------------------------
+--Create Jeff Moden's splitter function if it doesn't exist
+---------------------------------------------------------------------------------
+
+IF NOT EXISTS (SELECT *
+           FROM   sys.objects
+           WHERE  object_id = OBJECT_ID(N'[dbo].[DelimitedSplit8K]')
+                  AND type IN ( N'FN', N'IF', N'TF', N'FS', N'FT' ))
+
+			
+
+BEGIN
+
+declare @sql varchar(max)
+set @sql = '
+
+CREATE FUNCTION [dbo].[DelimitedSplit8K] (@pString VARCHAR(8000), @pDelimiter CHAR(1))
+--WARNING!!! DO NOT USE MAX DATA-TYPES HERE!  IT WILL KILL PERFORMANCE!
+
+RETURNS TABLE WITH SCHEMABINDING AS
+RETURN
+
+/* "Inline" CTE Driven "Tally Table" produces values from 1 up to 10,000...
+enough to cover VARCHAR(8000)*/
+
+  WITH E1(N) AS (
+                 SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL
+                 SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL
+                 SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1
+                ),                          --10E+1 or 10 rows
+       E2(N) AS (SELECT 1 FROM E1 a, E1 b), --10E+2 or 100 rows
+       E4(N) AS (SELECT 1 FROM E2 a, E2 b), --10E+4 or 10,000 rows max
+ cteTally(N) AS (--==== This provides the "base" CTE and limits the number of rows right up front
+                     -- for both a performance gain and prevention of accidental "overruns"
+                 SELECT TOP (ISNULL(DATALENGTH(@pString),0)) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM E4
+                ),
+cteStart(N1) AS (--==== This returns N+1 (starting position of each "element" just once for each delimiter)
+                 SELECT 1 UNION ALL
+                 SELECT t.N+1 FROM cteTally t WHERE SUBSTRING(@pString,t.N,1) = @pDelimiter
+                ),
+cteLen(N1,L1) AS(--==== Return start and length (for use in substring)
+                 SELECT s.N1,
+                        ISNULL(NULLIF(CHARINDEX(@pDelimiter,@pString,s.N1),0)-s.N1,8000)
+                   FROM cteStart s
+                )
+--===== Do the actual split. The ISNULL/NULLIF combo handles the length for the final element when no delimiter is found.
+ SELECT ItemNumber = ROW_NUMBER() OVER(ORDER BY l.N1),
+        Item       = SUBSTRING(@pString, l.N1, l.L1)
+   FROM cteLen l
+'
+exec(@sql)
+END
+
+ELSE
+
+BEGIN
+	IF NOT EXISTS (SELECT *
+			   FROM   sys.objects
+			   WHERE  object_id = OBJECT_ID(N'[dbo].[DelimitedSplit8K]')
+					  AND type IN ( N'FN', N'IF', N'TF', N'FS', N'FT' ))
+	begin
+		raiserror('[dbo].[DelimitedSplit8K] Split Function is not installed on this instance',16,1)
+		return
+	end
+END
+
+
+---------------------------------------------------------------------------------
+--variables used for emailing results
+---------------------------------------------------------------------------------
+if @emailResults = 1
+begin
+	declare @error_xml nvarchar(max)
+	declare @error_body nvarchar(max)
+
+	declare @agent_xml nvarchar(max)
+	declare @agent_body nvarchar(max)
+
+
+	declare @server varchar(256) = (select @@SERVERNAME)
+end
+
+
+
+---------------------------------------------------------------------------------
+--create tables to be used as exclusions
+---------------------------------------------------------------------------------
+
+declare @logTextExclusions table (LogText varchar(4000))
+insert into @logTextExclusions
+select Item from dbo.DelimitedSplit8K(@logTextExclusionsStr,';')
+
+
+declare @logTextExplicitSearch table (LogText varchar(4000))
+insert into @logTextExplicitSearch
+select Item from dbo.DelimitedSplit8K(@logTextExplicitSearchStr,';')
+
+
+declare @processInfoExclusions table (ProcessInfo varchar(256))
+insert into @processInfoExclusions
+select Item from dbo.DelimitedSplit8K(@processInfoExclusionsStr,';')
+
+
+---------------------------------------------------------------------------------
+--set @hours back to a negative number, so we can go back in time
+---------------------------------------------------------------------------------
+
+if @hoursBack is null set @hoursBack = 24
+set @hoursBack = (@hoursBack * -1)
+declare @startDate datetime = dateadd(hour, @hoursBack, getdate())
+
+
+
+
+---------------------------------------------------------------------------------
+--handle default subject
+---------------------------------------------------------------------------------
+
+if @subject is null set @subject  = @server + ' Error Log Report'
+
+
+---------------------------------------------------------------------------------
+--handle case sensitivitiy just in case
+--coalation should be handled / customized if need be
+---------------------------------------------------------------------------------
+
+update @logTextExclusions
+set LogText = lower(LogText)
+
+update @logTextExplicitSearch
+set LogText = lower(LogText)
+
+update @logTextExplicitSearch set LogText = '' where LogText is null
+
+update @processInfoExclusions
+set ProcessInfo = lower(ProcessInfo)
+
+
+
+
+---------------------------------------------------------------------------------
+--get the default @mailProfile for db_mail if one isn't passed in
+---------------------------------------------------------------------------------
+
+if @mailProfile is null
+begin
+
+	--exec msdb.dbo.sysmail_help_profile_sp 
+	--exec msdb.dbo.sysmail_help_account_sp 
+
+	if object_id('tempdb..#profile') is not null drop table #profile
+	create table #profile (  principal_id int
+							,principal_name varchar(256)
+							,profile_id int
+							,profile_name varchar(256)
+							,is_default bit)
+
+	insert into #profile
+	exec msdb.dbo.sysmail_help_principalprofile_sp  
+
+	set @mailProfile = (select top 1 profile_name from #profile where is_default = 1)
+end
+
+
+--suppose they didn't set a default? Get an arbritary one...
+
+if @mailProfile is null
+begin
+	set @mailProfile = (select top 1 profile_name from #profile)
+end
+
+
+
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+if(@operator is null and @email is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
+end
+else
+begin
+	declare @operator_email varchar(256) = coalesce(@email,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			declare @errMsg varchar(600) = 'No email address set for operator ' + @operator + ' or operator does not exist'
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+
+
+---------------------------------------------------------------------------------
+--tables to hold error log results
+---------------------------------------------------------------------------------
+
+if object_id('tempdb..##errorLog') is not null drop table ##errorLog
+
+create table ##errorLog(LogDate datetime2
+					  ,ProcessInfo varchar(64)
+					  ,LogText varchar(max))
+
+if object_id('tempdb..#agentLog') is not null drop table #agentLog
+
+create table #agentLog(LogDate datetime2
+					  ,ProcessInfo varchar(64)
+					  ,LogText varchar(max))
+
+
+
+
+---------------------------------------------------------------------------------
+--get errors from error log going back to @startDate
+--we cycle through the error logs in case there were multiple restarts
+---------------------------------------------------------------------------------
+
+DECLARE @FileList AS TABLE (
+  subdirectory NVARCHAR(4000) NOT NULL 
+  ,DEPTH BIGINT NOT NULL
+  ,[FILE] BIGINT NOT NULL
+ );
+ 
+DECLARE @ErrorLog NVARCHAR(4000), @ErrorLogPath NVARCHAR(4000);
+SELECT @ErrorLog = CAST(SERVERPROPERTY(N'errorlogfilename') AS NVARCHAR(4000));
+SELECT @ErrorLogPath = SUBSTRING(@ErrorLog, 1, LEN(@ErrorLog) - CHARINDEX(N'\', REVERSE(@ErrorLog))) + N'\';
+
+INSERT INTO @FileList
+EXEC xp_dirtree @ErrorLogPath, 0, 1;
+
+DECLARE @NumberOfLogfiles INT;
+SET @NumberOfLogfiles = (SELECT COUNT(*) FROM @FileList WHERE [@FileList].subdirectory LIKE N'ERRORLOG%');
+
+declare @i int = 0
+declare @maxDate datetime = (select max(isnull(LogDate,'19010101')) from ##errorLog)
+
+--2018-01-08 22:14:02.493
+
+while (@i < @NumberOfLogfiles or @maxDate < @startDate)
+begin
+set @sql = '
+insert into ##errorLog
+exec master.dbo.xp_readerrorlog
+	' + cast(@i as char(1)) + '
+	,1
+	," "
+	," "
+	,''' + convert(varchar(8),@startDate,112) + '''
+	,null
+	,"desc"
+	'
+	exec (@sql)
+	set @i = @i + 1
+	set @maxDate = (select max(isnull(LogDate,'19010101')) from ##errorLog)
+end
+
+
+
+---------------------------------------------------------------------------------
+--get errors from current agent log going back to @startDate
+---------------------------------------------------------------------------------
+insert into #agentLog
+exec master.dbo.xp_readerrorlog
+	0
+	,2
+	," "
+	," "
+	,@startDate
+	,null
+	,"desc"
+
+---------------------------------------------------------------------------------
+--get errors from previous agent log in case a restart happened 
+--still uses @startDate param
+---------------------------------------------------------------------------------
+insert into #agentLog
+exec master.dbo.xp_readerrorlog
+	1
+	,2
+	," "
+	," "
+	,@startDate
+	,null
+	,"desc"
+
+
+---------------------------------------------------------------------------------
+--return the error log results, while removing some noise
+---------------------------------------------------------------------------------
+
+
+if @emailResults = 0
+begin
+	select 
+		el.LogDate
+		,el.ProcessInfo
+		,el.LogText
+	from 
+		##errorLog el
+	left join
+		@logTextExclusions ex on
+		lower(el.LogText) like '%' + ex.LogText + '%'
+	left join
+		@logTextExplicitSearch es on
+		lower(el.LogText) like '%' + es.LogText + '%'
+	left join
+		@processInfoExclusions pie on
+		lower(el.ProcessInfo) = pie.ProcessInfo
+	where 
+		ex.LogText is null
+		and es.LogText is not null
+		and pie.ProcessInfo is null
+		and LogDate >= @startDate
+	order by
+		el.LogDate desc
+		,case when el.LogText like 'Error:%' then 1 else 2 end
+end
+
+else
+
+begin
+	if(select count(*)
+		from 
+			##errorLog el
+		left join
+			@logTextExclusions ex on
+			lower(el.LogText) like '%' + ex.LogText + '%'
+		left join
+			@logTextExplicitSearch es on
+			lower(el.LogText) like '%' + es.LogText + '%'
+		left join
+			@processInfoExclusions pie on
+			lower(el.ProcessInfo) = pie.ProcessInfo
+		where 
+			ex.LogText is null
+			and es.LogText is not null
+			and pie.ProcessInfo is null
+			and LogDate >= @startDate) > 0
+
+		begin
+		set @error_xml = cast(( select el.LogDate as 'td', '', el.ProcessInfo as 'td', '', el.LogText as 'td' 
+								from 
+									##errorLog el
+								left join
+									@logTextExclusions ex on
+									lower(el.LogText) like '%' + ex.LogText + '%'
+								left join
+									@logTextExplicitSearch es on
+									lower(el.LogText) like '%' + es.LogText + '%'
+								left join
+									@processInfoExclusions pie on
+									lower(el.ProcessInfo) = pie.ProcessInfo
+								where 
+									ex.LogText is null
+									and es.LogText is not null
+									and pie.ProcessInfo is null
+									and LogDate >= @startDate
+								for xml path('tr'), elements ) as nvarchar(max))
+
+		set @error_body = '<html><body><H3>SQL Error Log</H3>
+						<table border = 1>
+						<tr>
+						<th>LogDate</th> <th>ProcessInfo</th> <th>LogText</th>'
+
+		set @error_body = @error_body + @error_xml + '</table></body><html>'
+
+		
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @mailProfile		
+		,@recipients = @operator_email
+		,@subject = @subject
+		,@body = @error_body
+		,@body_format = 'HTML'
+	end
+end
+
+---------------------------------------------------------------------------------
+--return the agnet log results
+---------------------------------------------------------------------------------
+
+
+if @emailResults = 0
+begin
+	select *
+	from #agentLog
+	where LogDate >= @startDate
+	order by LogDate desc
+end
+
+else
+
+begin
+	if(select count(*) from #agentLog where LogDate >= @startDate) > 0
+	begin
+		set @error_xml = cast(( select [LogDate] as 'td', '', [ProcessInfo] as 'td', '', [LogText] as 'td' 
+							from #agentLog
+							where LogDate >= @startDate
+							for xml path('tr'), elements ) as nvarchar(max))
+
+		set @error_body = '<html><body><H3>SQL Agent Log</H3>
+						<table border = 1>
+						<tr>
+						<th>LogDate</th> <th>ProcessInfo</th> <th>LogText</th>'
+
+		set @error_body = @error_body + @error_xml + '</table></body><html>'
+		
+		set @subject = @server + ' Agent Log Report'
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @mailProfile			
+		,@recipients = @operator_email
+		,@subject = @subject
+		,@body = @error_body
+		,@body_format = 'HTML'
+	end
+end
+
+GO
+
+
