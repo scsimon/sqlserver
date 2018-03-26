@@ -1,0 +1,128 @@
+/***************************************************************************************************
+Script to kill domain SPID
+
+This script runs sp_who2 and places the SPID and login of all connections
+which the Login is like the somain specificed, for the database specified.
+Then, it loops through and kills the spids in the list, excluding the SPID
+of the user running the task (in case the user is logged in via Windows Authentication)
+
+
+2017-10-19		S.Simon		Inital Script
+2018-01-19		S.Simon		Turned into proc
+***************************************************************************************************/
+
+--alter procedure usp_kill_domain_spids(
+--											@domain varchar(64)
+--											,@database varchar(64) = null
+--											)
+--as
+
+
+
+---------------------------------------------------------------------------------------------------------------
+--testing parameters
+---------------------------------------------------------------------------------------------------------------
+
+declare @domain varchar(64) = 'yourDomain'
+declare @database varchar(64) = 'some_database'
+
+
+---------------------------------------------------------------------------------------------------------------
+--proc parameters
+---------------------------------------------------------------------------------------------------------------
+
+declare @Spid varchar(16)
+declare @sql varchar(4000)
+
+---------------------------------------------------------------------------------------------------------------
+--handle parameter defaults
+---------------------------------------------------------------------------------------------------------------
+
+if @database is null
+begin
+	set @database =  DB_NAME()
+end
+
+---------------------------------------------------------------------------------------------------------------
+--create temp to store sp_who2 results
+---------------------------------------------------------------------------------------------------------------
+if object_id('tempdb..#Who2') is not null drop table #Who2
+create table #Who2 (
+					SPID int null, 
+					Stat varchar(4000) null, 
+					LoginUser varchar(256) null,
+					HostName varchar(256) null, 
+					BlkBy varchar(256) null, 
+					DBName varchar(256) null, 
+					Command varchar(4000) null, 
+					CPUTime bigint null, 
+					DiskIO bigint null, 
+					LastBatch varchar(64) null, 
+					ProgramName varchar(256) null, 
+					SPID2 int null, 
+					RequestID int null
+					)
+
+---------------------------------------------------------------------------------------------------------------
+--load sp_who2 results
+---------------------------------------------------------------------------------------------------------------
+
+insert into #Who2 exec sp_who2
+
+
+---------------------------------------------------------------------------------------------------------------
+--delete all users who aren't domain accounts... 
+--and remove your SPID from the list to be deleted... 
+--and remove anything running locally on the box
+---------------------------------------------------------------------------------------------------------------
+
+
+delete from #Who2 
+where LoginUser not like + @domain + '%' 
+or DBName != @database 
+or SPID = @@SPID
+
+
+---------------------------------------------------------------------------------------------------------------
+--return the logins that will be dropped
+---------------------------------------------------------------------------------------------------------------
+
+select SPID, LoginUser as LoginToBeDropped from #Who2
+
+
+---------------------------------------------------------------------------------------------------------------
+--cursor for the SPIDs
+---------------------------------------------------------------------------------------------------------------
+
+declare cur cursor fast_forward for 
+	select
+		SPID
+	from #Who2
+
+
+---------------------------------------------------------------------------------------------------------------
+--loop through the SPIDs and kill them
+---------------------------------------------------------------------------------------------------------------
+
+open cur  
+fetch next from cur into @Spid
+
+while @@FETCH_STATUS = 0
+
+	begin
+		--select @Spid
+		set @sql = 'kill ' + @Spid
+		exec(@sql)
+		fetch next from cur into @Spid	
+	end	
+	
+close cur
+deallocate cur
+
+
+---------------------------------------------------------------------------------------------------------------
+--see what connections remain
+---------------------------------------------------------------------------------------------------------------
+
+exec sp_who2
+go
