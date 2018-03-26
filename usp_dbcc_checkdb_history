@@ -1,0 +1,285 @@
+
+
+/******************************************************************************************************************************************************************************
+Procedure to check for the last good DBCC CHECKDB run and send an email of a threshold is met with some information from the SQL Error Logs.
+
+If we are currently using IMS with their Patrol Agent, they "should" catch the error log information and open a critical ticket.
+However, 2 is 1 and 1 is none so we double down like a scary clown.
+
+2017-11-30		S.Simon		Created Proc
+2018-01-19		S.Simon		Added some checks for mailProfile... minor tweaks
+2018-02-06		S.Simon		Added logic to check error log instead of DBINFO if it's a RoR
+******************************************************************************************************************************************************************************/
+
+alter procedure usp_dbcc_checkdb_history(		@databaseName varchar(64)
+												,@HourThreshold int = null
+												,@operator varchar(16) = null
+												,@emails varchar(4000) = null
+												,@EmailProfile varchar(28) = null
+												,@emailResults bit = 1)
+
+
+as
+
+
+
+--declare @databaseName varchar(64) = 'TestDB'								--DB Name you want to check the status of the last good DBCC and Return Error logs about DBCC for
+--declare @HourThreshold int = 16											--If @LastGoodCheckDB is before getdate() - @HourThreshold email is triggered
+--declare @operator varchar(16) = null										--operator in SQL Server that gets emailed. It's important to schedule the job at the right time
+--declare @emails varchar(4000) = null										--this is used if @operator isn't specified. @emails takes priority
+--declare @EmailProfile varchar(28) = null									--name of the DB Mail profile used to send emails from SQL Server
+--declare @emailResults bit = 0												--1 emails, 0 returns results
+
+
+---------------------------------------------------------------------------------
+--Handle some default parameters
+---------------------------------------------------------------------------------
+if @HourThreshold is null set @HourThreshold = 16
+
+
+
+
+
+---------------------------------------------------------------------------------
+--get the default @mailProfile for db_mail if one isn't passed in
+---------------------------------------------------------------------------------
+
+if @EmailProfile is null and @emailResults = 1
+begin
+
+	--exec msdb.dbo.sysmail_help_profile_sp 
+	--exec msdb.dbo.sysmail_help_account_sp 
+
+	if object_id('tempdb..#profile') is not null drop table #profile
+	create table #profile (  principal_id int
+							,principal_name varchar(256)
+							,profile_id int
+							,profile_name varchar(256)
+							,is_default bit)
+
+	insert into #profile
+	exec msdb.dbo.sysmail_help_principalprofile_sp  
+
+	set @EmailProfile = (select top 1 profile_name from #profile where is_default = 1)
+end
+
+
+--suppose they didn't set a default? Get an arbritary one...
+
+if @EmailProfile is null and @emailResults = 1
+begin
+	set @EmailProfile = (select top 1 profile_name from #profile)
+end
+
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+
+if(@operator is null and @emails is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
+end
+else
+begin
+	declare @operator_email varchar(4000) = coalesce(@emails,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			declare @errMsg varchar(600) = 'No email address set for operator ' + @operator + ' or operator does not exist'
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+---------------------------------------------------------------------------------
+--local variables
+---------------------------------------------------------------------------------
+
+declare @LastGoodCheckDB datetime2			--ReturnValue for the last good DBCC run
+
+if @emailResults = 1
+begin
+	declare @xml nvarchar(max)					--used for making headers
+	declare @body nvarchar(max)					--used for HTML of email
+end
+
+
+/*
+Brent says you can find that last time a good DBCC was ran :)
+https://www.brentozar.com/archive/2015/08/getting-the-last-good-dbcc-checkdb-date/
+This snippet of code returns the last time a good DBCC ran for the database specified in @databaseName.
+The value is stored in @LastGoodCheckDB and is used to send an alert later on
+*/
+
+
+--------------------------------------------------------------------------------------------------------
+--if the DB isn't read only, we can use DBCC DBINFO.
+--If it is read_only, DBCC DBINFO data comes from the primary replica so it wouldn't 
+--match the actual DBCC CHECKDB times for the read only replica. So, we use error logs
+--------------------------------------------------------------------------------------------------------
+
+if (SELECT DATABASEPROPERTYEX(@databaseName,'Updateability')) = 'READ_WRITE'
+begin
+
+	if object_id('tempdb..#DBINFO') is not null
+	drop table #DBINFO
+
+	create table #DBINFO(	ParentObject varchar(256)
+							,Object varchar(256)
+							,Field varchar(256)
+							,Value varchar(256))
+	insert into #DBINFO
+	EXEC('DBCC DBINFO(' + @databaseName + ') WITH TABLERESULTS')
+
+
+	select @LastGoodCheckDB = [Value]
+	from #DBINFO
+	where Field = 'dbi_dbccLastKnownGood' 
+end
+else
+begin
+	if object_id('tempdb..#CheckDB') is not null drop table #CheckDB
+	create table #CheckDB(	LogDate datetime2
+							,ProcessInfo varchar(64)
+							,LogText varchar(max))
+	insert into #CheckDB 
+	exec sp_readerrorlog 0,1,'CHECKDB'
+	insert into #CheckDB 
+	exec sp_readerrorlog 1,1,'CHECKDB'
+
+select @LastGoodCheckDB = max(LogDate)
+from #CheckDB 
+where 
+	LogText like '%' + @databaseName + '%'
+	and LogText like '%found 0 errors and repaired 0 errors%'
+	and LogText not like '%informational message%'
+end
+
+--select @LastGoodCheckDB
+
+
+/*
+sp_readerrorlog takes four parameters:
+1 = Value of error log file you want to read: 0 = current, 1 = Archive #1, 2 = Archive #2, etc...
+2 = Log file type: 1 or NULL = error log, 2 = SQL Agent log
+3 = Search string 1: String one you want to search for
+4 = Search string 2: String two you want to search for to further refine the results
+
+Use xp_readerrrorlog if you need to use more parameters
+https://www.mssqltips.com/sqlservertip/1476/reading-the-sql-server-log-files-using-tsql/
+*/
+
+
+
+
+
+if (datediff(hour,@LastGoodCheckDB,getdate()) > @HourThreshold and @emailResults = 1)
+begin
+
+
+	--extract information from the SQL Error log about DBCC CHECKDB into a temp table
+	if object_id('tempdb..#ErrorLog') is not null
+	drop table #ErrorLog
+
+	create table #ErrorLog(	LogDate datetime2
+							,ProcessInfo varchar(16)
+							,LogText varchar(4000))
+
+	insert into #ErrorLog
+	exec sp_readerrorlog 0,1,'CHECKDB'	--current error log
+
+	insert into #ErrorLog
+	exec sp_readerrorlog 1,1,'CHECKDB'	--previous error log in case a reboot or something happened recently
+	
+	--extract some information from the results... specifically the number of errors and repairs. 
+	--For most databases repairs should always be 0 since even Microsoft states to use this as a last resort
+	if object_id('tempdb..#FormattedResultTable') is not null
+	drop table #FormattedResultTable
+
+	create table #FormattedResultTable(	LogDate datetime2
+										,DB_Checked varchar(64)
+										,ErrorsFound bigint
+										,ErrorsRepaired bigint)
+
+	insert into #FormattedResultTable
+	select
+		LogDate
+		--,LogText
+		,DB_Checked = @databaseName	
+		,ErrorsFound = substring(LogText,charindex('found',LogText) + 6,charindex('errors',LogText) - (charindex('found',LogText) + 6) - 1)
+		,ErrorsRepaired = substring(LogText,charindex('repaired',LogText) + 8,charindex('errors. Elapsed',LogText) - (charindex('repaired',LogText) + 9))
+	from #ErrorLog
+	where 
+		LogDate > dateadd(day,-2,@LastGoodCheckDB)	--return 3 days of error logs
+		and LogText like '%DBCC CHECKDB (' + @databaseName + ')%'
+
+
+
+	--Get the headers, format an HTML table, etc... prepare for email
+	set @xml = cast(( select isnull([LogDate],'') as 'td', '', isnull([DB_Checked],'') as 'td', '', isnull([ErrorsFound],'') as 'td', '', isnull([ErrorsRepaired],'') as 'td'  
+					  from #FormattedResultTable
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+	set @body = '<html>
+					<body>
+						<header>
+							<H3>The Last Good DBCC CHECKDB Was On: ' + case when @LastGoodCheckDB = '1900-01-01 00:00:00.0000000' then 'NEVER' else convert(varchar(19),@LastGoodCheckDB,120) end + '</H3>
+							<P>Below is some information from the SQL Error Logs</P>
+						</header>
+
+						 <table border = 1>
+						 <tr>
+							 <th>Log Date</th> 
+							 <th>DB_Checked</th> 
+							 <th>Errors Found</th> 
+							 <th>Errors Repaired</th>
+						 </tr>'
+
+
+	set @body = @body + isnull(@xml,'') + '
+									</table>
+									<P>
+										Suggested checking below results if errors exist:<br />
+										<br />
+											&emsp; <font face="Courier New">select top 10 *</font><br />
+											&emsp; <font face="Courier New">from msdb..suspect_pages</font><br />
+											&emsp; <font face="Courier New">where event_type in (1,2,3)</font><br />
+										<br />
+										Also start some steps like https://www.brentozar.com/archive/2016/05/dbcc-checkdb-reports-corruption/
+									</P>
+								</body>
+							<html>'
+
+
+	--get the email address for the operator. If this is null, use the @email address instead
+
+	declare @subject varchar(256) = 'DBCC CHECKDB Error Alert For ' + @databaseName 
+
+	--send email
+	exec msdb..sp_send_dbmail
+	@profile_name = @EmailProfile		
+	,@recipients = @operator_email
+	,@subject = @subject
+	,@body = @body
+	,@body_format = 'HTML'
+end
+
+else
+
+begin
+	select LastGoodCheckDB = @LastGoodCheckDB
+
+	if (datediff(hour,@LastGoodCheckDB,getdate()) > @HourThreshold)
+	begin
+		exec sp_readerrorlog 0,1,'CHECKDB'
+	
+		select top 10 *
+		from msdb..suspect_pages
+		where event_type in (1,2,3)
+
+		Select If_Corrupted_Check_Here = 'https://www.brentozar.com/archive/2016/05/dbcc-checkdb-reports-corruption/ '
+	end
+end
