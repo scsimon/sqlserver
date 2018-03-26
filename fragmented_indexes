@@ -1,0 +1,54 @@
+declare @object_id int
+declare c cursor local fast_forward for 
+select object_id from sys.objects where name like '%TIF%'
+											
+
+if object_id('tempdb.. #index_stats') is not null drop table  #index_stats
+
+create table #index_stats(	SchemaName varchar(64)
+							,TableName varchar(256)
+							,IndexName varchar(256)
+							,FragPercent float
+							,APL int
+							,PageCount bigint)
+
+open c
+fetch next from c into @object_id
+
+while @@FETCH_STATUS = 0
+begin
+
+	insert into #index_stats
+	SELECT	
+		schema_name = s.NAME
+		,table_name = o.NAME
+		,index_name = ix.NAME
+		,frag_pct = ips.avg_fragmentation_in_percent
+		,allow_page_locks = ix.allow_page_locks
+		,ips.page_count
+	FROM sys.dm_db_index_physical_stats(DB_ID(), @object_id, NULL, NULL, 'LIMITED') ips
+	JOIN sys.indexes ix ON (
+			ix.object_id = ips.object_id
+			AND ix.index_id = ips.index_id
+			)
+	JOIN sys.objects o ON (o.object_id = ips.object_id)
+	JOIN sys.schemas s ON (s.schema_id = o.schema_id)
+	WHERE 
+		--ips.avg_fragmentation_in_percent > @frag_pct_threshold -- fragmented above our threshold
+		--AND ips.page_count > @min_page_count -- contains at least this many pages
+		ips.index_id > 0		-- is not a heap
+		AND ix.is_disabled = 0	-- is not disabled
+		AND o.is_ms_shipped = 0 -- is not a system object
+	ORDER BY 
+		frag_pct DESC
+		,table_name
+		,index_name
+
+	fetch next from c into @object_id
+end
+
+select * 
+from #index_stats
+where FragPercent > 50
+order by FragPercent desc, PageCount
+drop table  #index_stats
