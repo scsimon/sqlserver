@@ -1,0 +1,319 @@
+
+/**************************************************************************************************************************
+Proc to return results of sp_Blitz from the history table BlitzHistory stored on DB AdminTools. This can be changed
+if it's needed to work elsewhere of course.
+
+Proc is primary used in job to email results daily. However, realtime / adhoc use is just as applicable
+
+Assumes you have a database for admin scripts. In this case, it's AdminTools. Use what ever you want. Also assumes you have sp_Blitz
+
+
+2018-01-19		S.Simon		Created Proc
+2018-01-23		S.Simon		Added @excludeDBfinding and @excludeDetails
+**************************************************************************************************************************/
+
+create proc [dbo].[usp_blitz_report](
+									@emailResults bit = 0
+									,@mailProfile varchar(256) = null
+									,@operator varchar(256) = null
+									,@email varchar(4000) = null
+									,@date date = null
+									,@excludedDBs varchar(4000) = 'AdminTools'
+									,@bodyFormat char(4) = 'HTML'
+									,@runBlitzNow bit = 0
+									,@excludeDBfinding varchar(max) = null
+									,@excludeDetails varchar(max) = null
+								 )
+as
+
+
+-------------------------------------------------------------------------------------
+------params for testing
+-------------------------------------------------------------------------------------
+--declare @emailResults bit = 0												--1 emails results, 0 doesn't
+--declare @mailProfile varchar(256) = null									--mail profile used for sp_send_dbmail. We get a profile if left null, with default profile as precedence 
+--declare @operator varchar(256) = null										--operator profile to send the email to
+--declare @email varchar(4000) = null										--email address / addresses to send email to. @operator email used if both passed in
+--declare @date date = '20170119'											--date filter for results of sp_Blitz. getdate() default
+--declare @excludedDBs varchar(4000) = 'AdminTools;msdb;master;tempdb'		--semi colon seperated list of DBs to exclude from results
+--declare @bodyFormat char(4) = 'HTML'										--body format. TEXT or HTML
+--declare @runBlitzNow bit = 0												--will run sp_Blitz before returning results so data is current. Stores in BlitzHistory table
+--declare @excludeDBfinding varchar(max) = null								--this is hack. Combonation of Finding + ' ' + DatabaseName to exclude from results to keep email from firing delimited by ;
+--																			--Perhaps you have a DB you want checked, but don't want an email firing if it is just an alert for no CHECKDB running.
+--																			--This is a good use case for this.
+--declare @excludeDetails varchar(max)										--any specific details you want excluded for an instance to keep email from firing delimited by ;
+
+--set @excludeDBfinding = 'a finding you want to exclude'
+--set @excludeDetails = 'something you want to exclude'
+
+---------------------------------------------------------------------------------
+--run sp_Blitz now if stated in case job is set to run less frequent
+--change these based on the environment
+---------------------------------------------------------------------------------
+
+if @runBlitzNow = 1
+begin
+	declare @currentDate datetime = getdate()
+
+	exec sp_Blitz
+	@IgnorePrioritiesAbove = 99
+	,@OutputDatabaseName = 'AdminTools'
+	,@OutputSchemaName = 'dbo'
+	,@OutputTableName = 'BlitzHistory'		
+end
+
+
+---------------------------------------------------------------------------------
+--Create Jeff Moden's splitter function if it doesn't exist
+---------------------------------------------------------------------------------
+
+IF NOT EXISTS (SELECT *
+           FROM   sys.objects
+           WHERE  object_id = OBJECT_ID(N'[dbo].[DelimitedSplit8K]')
+                  AND type IN ( N'FN', N'IF', N'TF', N'FS', N'FT' ))
+
+			
+
+BEGIN
+
+declare @sql varchar(max)
+set @sql = '
+
+CREATE FUNCTION [dbo].[DelimitedSplit8K] (@pString VARCHAR(8000), @pDelimiter CHAR(1))
+--WARNING!!! DO NOT USE MAX DATA-TYPES HERE!  IT WILL KILL PERFORMANCE!
+
+RETURNS TABLE WITH SCHEMABINDING AS
+RETURN
+
+/* "Inline" CTE Driven "Tally Table" produces values from 1 up to 10,000...
+enough to cover VARCHAR(8000)*/
+
+  WITH E1(N) AS (
+                 SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL
+                 SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL
+                 SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1
+                ),                          --10E+1 or 10 rows
+       E2(N) AS (SELECT 1 FROM E1 a, E1 b), --10E+2 or 100 rows
+       E4(N) AS (SELECT 1 FROM E2 a, E2 b), --10E+4 or 10,000 rows max
+ cteTally(N) AS (--==== This provides the "base" CTE and limits the number of rows right up front
+                     -- for both a performance gain and prevention of accidental "overruns"
+                 SELECT TOP (ISNULL(DATALENGTH(@pString),0)) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM E4
+                ),
+cteStart(N1) AS (--==== This returns N+1 (starting position of each "element" just once for each delimiter)
+                 SELECT 1 UNION ALL
+                 SELECT t.N+1 FROM cteTally t WHERE SUBSTRING(@pString,t.N,1) = @pDelimiter
+                ),
+cteLen(N1,L1) AS(--==== Return start and length (for use in substring)
+                 SELECT s.N1,
+                        ISNULL(NULLIF(CHARINDEX(@pDelimiter,@pString,s.N1),0)-s.N1,8000)
+                   FROM cteStart s
+                )
+--===== Do the actual split. The ISNULL/NULLIF combo handles the length for the final element when no delimiter is found.
+ SELECT ItemNumber = ROW_NUMBER() OVER(ORDER BY l.N1),
+        Item       = SUBSTRING(@pString, l.N1, l.L1)
+   FROM cteLen l
+'
+exec(@sql)
+END
+
+ELSE
+
+BEGIN
+	IF NOT EXISTS (SELECT *
+			   FROM   sys.objects
+			   WHERE  object_id = OBJECT_ID(N'[dbo].[DelimitedSplit8K]')
+					  AND type IN ( N'FN', N'IF', N'TF', N'FS', N'FT' ))
+	begin
+		raiserror('[dbo].[DelimitedSplit8K] Split Function is not installed on this instance',16,1)
+		return
+	end
+END
+
+
+
+
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+
+if(@operator is null and @email is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
+end
+else
+begin
+	declare @operator_email varchar(256) = coalesce(@email,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			declare @errMsg varchar(600) = 'No email address set for operator' + @operator
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+---------------------------------------------------------------------------------
+--get the default @mailProfile for db_mail if one isn't passed in
+---------------------------------------------------------------------------------
+
+if @mailProfile is null and @emailResults = 1
+begin
+
+	--exec msdb.dbo.sysmail_help_profile_sp 
+	--exec msdb.dbo.sysmail_help_account_sp 
+
+	if object_id('tempdb..#profile') is not null drop table #profile
+	create table #profile (  principal_id int
+							,principal_name varchar(256)
+							,profile_id int
+							,profile_name varchar(256)
+							,is_default bit)
+
+	insert into #profile
+	exec msdb.dbo.sysmail_help_principalprofile_sp  
+
+	set @mailProfile = (select top 1 profile_name from #profile where is_default = 1)
+end
+
+
+--suppose they didn't set a default? Get an arbritary one... maybe we need to make sure it works?
+
+if @mailProfile is null and @emailResults = 1
+begin
+	set @mailProfile = (select top 1 profile_name from #profile)
+end
+
+---------------------------------------------------------------------------------
+--handle date default
+---------------------------------------------------------------------------------
+
+if @date is null
+begin
+	set @date = cast(getdate() as date)
+end
+
+
+---------------------------------------------------------------------------------
+--create table of databases to exclude
+---------------------------------------------------------------------------------
+
+declare @databaseExclusions table (databaseName varchar(4000))
+insert into @databaseExclusions
+select Item from dbo.DelimitedSplit8K(@excludedDBs,';')
+
+
+---------------------------------------------------------------------------------
+--create table of DB findings to exclude
+---------------------------------------------------------------------------------
+
+declare @dbFindingsExclusions table (dbFinding varchar(4000))
+insert into @dbFindingsExclusions
+select Item from dbo.DelimitedSplit8K(@excludeDBfinding,';')
+
+
+---------------------------------------------------------------------------------
+--create table of details to exclude
+---------------------------------------------------------------------------------
+
+declare @detailsExclusions table (details varchar(4000))
+insert into @detailsExclusions
+select Item from dbo.DelimitedSplit8K(@excludeDetails,';')
+
+
+---------------------------------------------------------------------------------
+--variables used for emailing results
+---------------------------------------------------------------------------------
+if @emailResults = 1
+begin
+	declare @xml nvarchar(max)
+	declare @body nvarchar(max)
+
+	declare @server varchar(256) = (select @@SERVERNAME)
+	declare @subject varchar(1024)
+end
+
+
+---------------------------------------------------------------------------------
+--return the results
+---------------------------------------------------------------------------------
+if @emailResults = 0
+begin
+	select
+		ServerName
+		,CheckDate = convert(varchar(19),CheckDate,120)
+		,[Priority]
+		,FindingsGroup
+		,Finding
+		,DatabaseName
+		,[URL]
+		,Details
+	from BlitzHistory
+	where
+		 isnull(DatabaseName,'') not in (select isnull(databaseName,'booyakasha') from @databaseExclusions)
+		 and isnull(Details,'') not in (select isnull(details,'booyakasha') from @detailsExclusions)
+		 and isnull(Finding,'') + ' ' + isnull(DatabaseName,'') not in (select isnull(dbFinding,'booyakasha') from @dbFindingsExclusions)
+		 and CheckID not in (-1,156)													--Captians log and script info
+		 and CheckDate >= case when @runBlitzNow = 1 then @currentDate else @date end	--Don't get duplicate days data if you want fresh stuff
+	order by 
+		DatabaseName 
+		,[Priority]
+		,ID
+		,CheckDate
+end
+
+else
+begin
+	if(
+		select count(*) 
+		from BlitzHistory
+		where 
+		 isnull(DatabaseName,'') not in (select isnull(databaseName,'booyakasha') from @databaseExclusions)
+		 and isnull(Details,'') not in (select isnull(details,'booyakasha') from @detailsExclusions)
+		 and isnull(Finding,'') + ' ' + isnull(DatabaseName,'') not in (select isnull(dbFinding,'booyakasha') from @dbFindingsExclusions)
+		 and CheckID not in (-1,156)													--Captians log and script info
+		 and CheckDate >= case when @runBlitzNow = 1 then @currentDate else @date end	--Don't get duplicate days data if you want fresh stuff
+	   ) > 0
+	
+	begin
+
+		set @xml = cast(( select ServerName as 'td', '', convert(varchar(19),CheckDate,120) as 'td', '', [Priority] as 'td', '', [FindingsGroup] as 'td', '', [Finding] as 'td', '', isnull([DatabaseName],'') as 'td', '', isnull([URL],'') as 'td', '', [Details] as 'td'
+						  from BLitzHistory
+						  where isnull(DatabaseName,'') not in (select isnull(databaseName,'booyakasha') from @databaseExclusions)
+								and isnull(Details,'') not in (select isnull(details,'booyakasha') from @detailsExclusions)
+								and isnull(Finding,'') + ' ' + isnull(DatabaseName,'') not in (select isnull(dbFinding,'booyakasha') from @dbFindingsExclusions)
+								and CheckID not in (-1,156)														--Captians log and script info
+								and CheckDate >= case when @runBlitzNow = 1 then @currentDate else @date end	--Don't get duplicate days data if you want fresh stuff
+						  order by DatabaseName, [Priority], ID, CheckDate
+						  for xml path('tr'), elements ) as nvarchar(max))
+
+
+		set @body = '<html><body><H3>SP_Blitz Report</H3>
+						<table border = 1>
+						<tr>
+							<th>ServerName</th> 
+							<th>CheckDate</th> 
+							<th>Priority</th> 
+							<th>FindingsGroup</th> 
+							<th>Finding</th> 
+							<th>DatabaseName</th> 
+							<th>URL</th> 
+							<th>Details</th>'
+
+		set @body = @body + @xml + '</table></body><html>'
+
+		set @subject = @server + ' SP_Blitz Report'
+
+		set @bodyFormat = upper(@bodyFormat)
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @mailProfile	
+		,@recipients = @operator_email
+		,@subject = @subject
+		,@body = @body
+		,@body_format = @bodyFormat
+	end
+
+end
