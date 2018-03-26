@@ -1,0 +1,87 @@
+
+/***************************************************************************************************
+Script to kill non-system SPID
+
+Script to use DMV sys.dm_exec_sessions to kill all non-system spids
+
+
+2017-10-19		S.Simon		Inital Script
+2018-01-19		S.Simon		Turned into proc
+***************************************************************************************************/
+
+create procedure usp_kill_non_sys_spids(
+											@database varchar(64) = null
+											)
+as
+
+
+
+-----------------------------------------------------------------------------------------------------------------
+----testing parameters
+-----------------------------------------------------------------------------------------------------------------
+
+--declare @database varchar(64) = (select DB_NAME())
+
+---------------------------------------------------------------------------------------------------------------
+--proc parameters
+---------------------------------------------------------------------------------------------------------------
+
+declare @Spid varchar(16)
+declare @sql varchar(4000)
+
+---------------------------------------------------------------------------------------------------------------
+--handle parameter defaults
+---------------------------------------------------------------------------------------------------------------
+
+if @database is null
+begin
+	set @database =  DB_NAME()
+end
+
+---------------------------------------------------------------------------------------------------------------
+--return the logins that will be dropped
+---------------------------------------------------------------------------------------------------------------
+
+SELECT session_id, login_name, host_name, login_time, client_interface_name, db_name(database_id)
+FROM sys.dm_exec_sessions
+WHERE  is_user_process = 1 and db_name(database_id) = @database
+
+
+---------------------------------------------------------------------------------------------------------------
+--cursor for the SPIDs
+---------------------------------------------------------------------------------------------------------------
+
+declare cur cursor fast_forward for 
+select session_id
+from sys.dm_exec_sessions
+where  is_user_process = 1 and db_name(database_id) = @database
+
+---------------------------------------------------------------------------------------------------------------
+--loop through the SPIDs and kill them
+---------------------------------------------------------------------------------------------------------------
+
+open cur  
+fetch next from cur into @Spid
+
+while @@FETCH_STATUS = 0
+
+	begin
+		--select @Spid
+		set @sql = 'kill ' + @Spid
+		exec(@sql)
+		fetch next from cur into @Spid	
+	end	
+	
+close cur
+deallocate cur
+
+
+---------------------------------------------------------------------------------------------------------------
+--see what connections remain
+---------------------------------------------------------------------------------------------------------------
+
+SELECT session_id, login_name, host_name, login_time, client_interface_name, db_name(database_id)
+FROM sys.dm_exec_sessions
+WHERE  is_user_process = 1 and db_name(database_id) = @database
+
+go
