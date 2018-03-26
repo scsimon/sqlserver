@@ -1,0 +1,211 @@
+
+
+/****************************************************************************************************************************
+Script by Max Vernon to check database mail and if it's configured in SQL Agent
+
+https://dba.stackexchange.com/questions/199827/query-sql-server-alert-system-mail-session-settings/199841#199841
+
+2018-03-09		S.Simon			Created Proc
+
+****************************************************************************************************************************/
+
+
+create proc [dbo].[usp_check_dbmail_config] (@emailResults bit = 1, @alertOnly bit = 1, @emailAddress varchar(4000) = null, @operator varchar(256) = null)
+as
+
+
+
+declare @subject varchar(4000)
+declare @body varchar(4000)
+declare @errMsg varchar(4000)
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+
+if(@operator is null and @emailAddress is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
+end
+else
+begin
+	declare @operator_email varchar(4000) = coalesce(@emailAddress,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			set @errMsg = 'No email address set for operator ' + @operator + ' or operator does not exist'
+			EXEC xp_logevent 60000, @errMsg, error  
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+
+
+/* 
+   Confirm the Database Mail account and profile is configured correctly 
+*/ 
+
+DECLARE @ProfileName VARCHAR(255);  
+DECLARE @AccountName VARCHAR(255);  
+DECLARE @AccountFromAddress VARCHAR(255);  
+DECLARE @AccountReplyTo VARCHAR(255);  
+DECLARE @SMTPServer VARCHAR(255);  
+DECLARE @SMTPPort VARCHAR(255);  
+DECLARE @DatabaseMail VARCHAR(255);  
+
+SELECT   
+    @ProfileName = smp.name  
+    , @AccountName = sma.name  
+    , @AccountFromAddress = sma.email_address  
+    , @AccountReplyTo = sma.replyto_address  
+    , @SMTPServer = sms.servername  
+    , @SMTPPort = sms.port  
+FROM msdb.dbo.sysmail_account sma  
+    INNER JOIN msdb.dbo.sysmail_profileaccount smpa ON sma.account_id = smpa.account_id  
+    INNER JOIN msdb.dbo.sysmail_profile smp ON smpa.profile_id = smp.profile_id  
+    INNER JOIN msdb.dbo.sysmail_server sms ON sma.account_id = sms.account_id;
+
+/*  
+    Confirm SQL Server Agent is configured to use Database Mail correctly  
+*/  
+DECLARE @res TABLE  
+(  
+    Value VARCHAR(255)  
+    , Data VARCHAR(255)  
+);  
+INSERT INTO @res  
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', N'UseDatabaseMail';  
+INSERT INTO @res  
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', N'DatabaseMailProfile';  
+IF (  
+        SELECT COUNT(*)  
+        FROM @res r  
+        WHERE r.Value = 'UseDatabaseMail' AND r.Data = 1  
+    ) = 1 AND   
+    (  
+        SELECT COUNT(*)  
+        FROM @res r  
+        WHERE r.Value = 'DatabaseMailProfile' AND r.Data IS NOT NULL  
+    ) = 1  
+SET @DatabaseMail = 'Configured'  
+ELSE  
+SET @DatabaseMail = 'Not Configured';  
+
+
+
+
+if @emailResults = 1 and @alertOnly = 1 and @DatabaseMail = 'Not Configured' and ltrim(rtrim(isnull(@AccountFromAddress,''))) != '' and ltrim(rtrim(isnull(@SMTPServer,''))) != '' and ltrim(rtrim(isnull(@SMTPPort,''))) != ''
+begin
+	set @subject = @@SERVERNAME + ': SQL Server Agent Email DISABLED'
+	set @body = 'Agent Email Not Configured For: ' + @@SERVERNAME 
+
+	exec msdb..sp_send_dbmail
+	@profile_name = @ProfileName		
+	,@recipients = @operator_email
+	,@subject = @subject
+	,@body = @body
+	,@body_format = 'HTML'
+end
+
+
+
+if @emailResults = 1 and @alertOnly = 0 and ltrim(rtrim(isnull(@AccountFromAddress,''))) != '' and ltrim(rtrim(isnull(@SMTPServer,''))) != '' and ltrim(rtrim(isnull(@SMTPPort,''))) != ''
+begin
+	declare @xml varchar(max)
+	--Get the headers, format an HTML table, etc... prepare for email
+	set @xml = cast(( select isnull(@@SERVERNAME,'') as 'td', '', 
+							 isnull(@ProfileName,'') as 'td', '', 
+							 isnull(@AccountName,'') as 'td', '', 
+							 isnull(@AccountFromAddress,'') as 'td', '', 
+							 isnull(@AccountReplyTo,'') as 'td', '',
+							 isnull(@SMTPServer,'') as 'td', '',
+							 isnull(@SMTPPort,'') as 'td', '',
+							 isnull(@DatabaseMail,'') as 'td'
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+
+	set @body = '<html>
+					<body>
+						<header>
+							<H3>SQL Server DB Mail Results</H3>
+							<P>Below is some information on the SQL Server Database Mail configuration</P>
+						</header>
+
+						 <table border = 1>
+						 <tr>
+							 <th>ServerName</th> 
+							 <th>ProfileName</th> 
+							 <th>AccountName</th> 
+							 <th>AccountFromAddress</th>
+							 <th>AccountReplyTo</th>
+							 <th>SMTPServer</th>
+							 <th>SMTPPort</th>
+							 <th>DatabaseMail</th>
+						 </tr>'
+
+	set @body = @body + isnull(@xml,'') 
+
+	set @subject = @@SERVERNAME + ': SQL Server DB Mail Configuration'
+
+	exec msdb..sp_send_dbmail
+	@profile_name = @ProfileName		
+	,@recipients = @operator_email
+	,@subject = @subject
+	,@body = @body
+	,@body_format = 'HTML'
+
+end
+
+
+if @emailResults = 1 and (ltrim(rtrim(isnull(@AccountFromAddress,''))) = '' or ltrim(rtrim(isnull(@SMTPServer,''))) = '' or ltrim(rtrim(isnull(@SMTPPort,''))) = '')
+begin
+	set @errMsg = 'DB Mail Profile Not Configured. Alerts will not be sent. usp_check_dbmail_config executed with @emailResults = 1'
+	raiserror(@errMsg,16,1) with log
+	return
+end
+
+if @emailResults = 0
+begin
+SELECT  ServerName = @@SERVERNAME  
+    , ProfileName = @ProfileName  
+    , AccountName = @AccountName  
+    , AccountFromAddress = @AccountFromAddress  
+    , AccountReplyTo = @AccountReplyTo  
+    , SMTPServer = @SMTPServer  
+    , SMTPPort = @SMTPPort  
+    , AgentDatabaseMail = @DatabaseMail; 
+end
+
+
+
+
+/*
+
+
+---Various parameters used by SQL Server Agent are stored in the registry. I use this code to get those details:
+
+DECLARE @res TABLE  
+(  
+    Value VARCHAR(255)  
+    , Data VARCHAR(255)  
+);  
+
+INSERT INTO @res  
+EXEC master.dbo.xp_instance_regread
+         @rootkey      = N'HKEY_LOCAL_MACHINE'
+       , @key          = N'Software\Microsoft\MSSQLServer\SQLServerAgent'
+       , @value_name   = N'DatabaseMailProfile';
+
+INSERT INTO @res  
+EXEC sys.xp_instance_regread
+         @rootkey      = N'HKEY_LOCAL_MACHINE'
+       , @key          = N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent'
+       , @value_name   = N'UseDatabaseMail'
+
+SELECT *
+FROM @res;
+
+*/
