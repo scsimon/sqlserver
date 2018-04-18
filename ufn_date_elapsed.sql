@@ -5,7 +5,7 @@ Credit: https://stackoverflow.com/users/1570000/john-cappelletti
 
 
 
-CREATE FUNCTION [dbo].[tvf-Date-Elapsed] (@D1 DateTime,@D2 DateTime)
+CREATE FUNCTION [dbo].[ufn_date_elapsed] (@D1 DateTime,@D2 DateTime)
 Returns Table
 Return (
     with cteBN(N)   as (Select 1 From (Values(1),(1),(1),(1),(1),(1),(1),(1),(1),(1)) N(N)),
