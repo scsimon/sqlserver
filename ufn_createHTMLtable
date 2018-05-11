@@ -1,0 +1,83 @@
+
+/************************************************************************************************
+Function to build a HTML table.
+
+Created by Shnugo on SO: https://stackoverflow.com/a/39487565/6167855
+
+Usage:
+
+declare @body xml = 
+	(select AdminTools.dbo.ufn_CreateHTMLTable (
+	(select * from SomeTable for xml path ('row'),elements xsinil)
+	,null,null,null))
+
+--CSS to make borders, which makes us change datatype
+declare @body_html varchar(max)
+set @body_html =  
+	'<style type="text/css" media="screen,print">
+	.center
+	{
+		text-align: center;
+	}
+	table,th
+	{
+		border: 1px solid black;
+	}
+	table,tr
+	{
+		border: 1px solid black;
+	}
+	table,td
+	{
+		border: 1px solid black;
+	}
+	</style>' 
+	+ cast(@body as varchar(max))
+
+Then @body_html for sp_send_dbmail
+
+************************************************************************************************/
+
+CREATE FUNCTION [dbo].[ufn_CreateHTMLTable]
+(
+    @SelectForXmlPathRowElementsXsinil XML
+   ,@tblClass VARCHAR(100) --NULL to omit this class
+   ,@thClass VARCHAR(100)  --same
+   ,@tbClass VARCHAR(100)  --same
+)
+RETURNS XML
+AS
+BEGIN
+
+RETURN 
+(
+    SELECT @tblClass AS [@class]  
+    ,@thClass AS [thead/@class]
+    ,@SelectForXmlPathRowElementsXsinil.query(
+              N'let $first:=/row[1]
+                return 
+                <tr> 
+                {
+                for $th in $first/*
+                return <th>{if(not(empty($th/@caption))) then xs:string($th/@caption) else local-name($th)}</th>
+                }
+                </tr>') AS thead
+    ,@tbClass AS [tbody/@class]
+    ,@SelectForXmlPathRowElementsXsinil.query(
+               N'for $tr in /row
+                 return 
+                 <tr>{$tr/@class}
+                 {
+                 for $td in $tr/*
+                 return
+                 if(empty($td/@link)) 
+                 then <td>{$td/@class}{string($td)}</td>
+                 else <td>{$td/@class}<a href="{$td/@link}">{string($td)}</a></td>
+                 }
+                 </tr>') AS tbody
+    FOR XML PATH('table'),TYPE
+) 
+END
+
+GO
+
