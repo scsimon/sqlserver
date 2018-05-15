@@ -153,7 +153,7 @@ end
 --2012 onward, use dmv
 -----------------------------------------------------------------------------
 
-if(select left(convert(varchar(16),serverproperty('ProductVersion')),charindex('.',convert(varchar(16),serverproperty('ProductVersion')),0) - 1)) > 11
+if(select left(convert(varchar(16),serverproperty('ProductVersion')),charindex('.',convert(varchar(16),serverproperty('ProductVersion')),0) - 1)) >= 11
 begin
 	
 	if object_id('tempdb..#logspaceusage') is not null 
