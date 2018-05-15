@@ -199,7 +199,7 @@ begin
 								,[program_name] sysname
 								,[host_name] sysname)
 			
-	exec AdminTools.dbo.sp_whoIsActive  @destination_table = #whoIsActive, @filter_type = 'session', @filter = @SPID, @show_own_spid = 0, @output_column_list = '[dd%][sql_text][login_name][status][program_name][host_name]'
+	exec AdminTools.dbo.sp_WhoIsActive  @destination_table = #whoIsActive, @filter_type = 'session', @filter = @SPID, @show_own_spid = 0, @output_column_list = '[dd%][sql_text][login_name][status][program_name][host_name]'
 			
 	--select * from #whoIsActive
 
