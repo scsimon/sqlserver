@@ -1,0 +1,1278 @@
+use [AdminTools]
+go
+
+/***********************************************************************************************************************
+Procedure to check for sql agent job and schedule changes and send an email with the changes.
+Also logs the changes, so you can always query the "history" tables get the changes
+
+NOTE: This isn't an auditing feature. If multiple changes take place to a job before this is ran, only
+the last change would be captured. It's meant as more of a "heads up something changed" versus something to track
+every single change. You could run this ever x minutes to use it as psudo auditing mechanism
+
+
+2018-05-15		S.Simon		Created Proc
+
+***********************************************************************************************************************/
+
+
+
+create procedure usp_sql_agent_job_changes(	 @emailResults bit = 0
+											,@mailProfile varchar(256) = null
+											,@operator varchar(256) = null
+											,@email varchar(4000) = null
+											,@initalize bit = 0
+											,@onlyChanges bit = 1
+											)
+as
+
+------user variables for testing
+----declare @emailResults bit = 1												--1 emails results, 0 doesn't
+----declare @mailProfile varchar(256) = null									--mail profile used for sp_send_dbmail. We get a profile if left null, with default profile as precedence 
+----declare @operator varchar(256) = null										--operator profile to send the email to
+----declare @email varchar(4000) = 'email@domain.com'							--email address / addresses to send email to. @operator email used if both passed in
+----declare @initalize bit = 0													--set to 1 if you want the tables dropped, recreated and initally populated
+----declare @onlyChanges bit = 1												--set to 0 if you want to just return all jobs, steps, schedules etc (running from SSMS or something). This doens't work with @emailResults = 1. It won't email
+
+
+
+
+---------------------------------------------------------------------------------
+--don't send emails if you want everything returned, and don't initalize
+---------------------------------------------------------------------------------
+
+if (@onlyChanges = 0)
+begin
+	set @emailResults = 0
+end
+
+
+---------------------------------------------------------------------------------
+--if you are initalizing, don't send email either (but do return current state)
+---------------------------------------------------------------------------------
+if (@initalize = 1)
+begin
+	set @emailResults = 0
+	set @onlyChanges = 0
+end
+
+
+---------------------------------------------------------------------------------
+--only email the changes, and don't override
+---------------------------------------------------------------------------------
+if (@emailResults = 1)
+begin
+	set @onlyChanges = 1
+	set @initalize = 0
+end	
+
+
+
+---------------------------------------------------------------------------------
+--static tables
+---------------------------------------------------------------------------------
+declare @subject varchar(2000) = null										--is set staticially before emails are sent, depending on the change
+declare @body xml = null													--used to build out the table dynamically
+declare @body_html varchar(max) = null										--used to add CSS so i don't edit the function--and there's probably a better way
+declare @errMsg varchar(600) = null
+
+
+---------------------------------------------------------------------------------
+--Temp tables to hold some results
+---------------------------------------------------------------------------------
+
+	
+if object_id('tempdb..#JobDetails') is not null
+drop table #JobDetails
+	
+if object_id('tempdb..#JobScheduleDetails') is not null
+drop table #JobScheduleDetails
+
+CREATE TABLE #JobScheduleDetails(
+												[schedule_uid] [uniqueidentifier]  NULL,
+												[schedule_id] [int]  NULL,
+												[job_name] [sysname]  NULL,
+												[schedule_name] [sysname]  NULL,
+												[schedule_frequency] [varchar](256) NULL,
+												[schedule_enabled] [int]  NULL,
+												[version_number] [int]  NULL,
+												[date_created] [datetime]  NULL,
+												[date_modified] [datetime]  NULL
+												) ON [PRIMARY]
+	CREATE TABLE #JobDetails(
+										[job_id] [uniqueidentifier] NOT NULL,
+										[job_name] [sysname] NULL,
+										[job_desc] [nvarchar](600) NULL,
+										[enabled] [tinyint]  NULL,
+										[date_created] [datetime] NULL,
+										[date_modified] [datetime] NULL,
+										[version_number] [int] NULL,
+										[start_step_id] [int] NULL,
+										[job_owner] [sysname] NULL,
+										[notify_level_eventlog] [varchar](100) NULL,
+										[notify_level_email] [varchar](100) NULL,
+										[email_operator_name] [sysname] NULL,
+										[email_operator_email] [nvarchar](100) NULL,
+										[email_operator_enabled] [tinyint] NULL,
+										[level_page] [varchar](100) NULL,
+										[page_operator_name] [sysname] NULL,
+										[page_operator_address] [nvarchar](100) NULL,
+										[page_operator_enabled] [tinyint] NULL,
+										[page_operator_scheduled_days] [varchar](50) NULL,
+										[page_operator_weekday_sked] [varchar](100) NULL,
+										[page_operator_saturday_sked] [varchar](100) NULL,
+										[page_operator_sunday_sked] [varchar](100) NULL,
+										[step_id] [int] NULL,
+										[step_name] [sysname] NULL,
+										[command] [nvarchar](max) NULL,
+										[on_success_action] [varchar](64) NULL,
+										[on_fail_action] [varchar](64) NULL
+									) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+
+
+
+
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+
+if(@operator is null and @email is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
+end
+else
+begin
+	declare @operator_email varchar(256) = coalesce(@email,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			set @errMsg = 'No email address set for operator' + @operator
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+---------------------------------------------------------------------------------
+--get the default @mailProfile for db_mail if one isn't passed in
+---------------------------------------------------------------------------------
+
+if @mailProfile is null and @emailResults = 1
+begin
+
+	--exec msdb.dbo.sysmail_help_profile_sp 
+	--exec msdb.dbo.sysmail_help_account_sp 
+
+	if object_id('tempdb..#profile') is not null drop table #profile
+	create table #profile (  principal_id int
+							,principal_name varchar(256)
+							,profile_id int
+							,profile_name varchar(256)
+							,is_default bit)
+
+	insert into #profile
+	exec msdb.dbo.sysmail_help_principalprofile_sp  
+
+	set @mailProfile = (select top 1 profile_name from #profile where is_default = 1)
+end
+
+
+--suppose they didn't set a default? Get an arbritary one...
+
+if @mailProfile is null and @emailResults = 1
+begin
+	set @mailProfile = (select top 1 profile_name from #profile)
+end
+
+--still nada? throw an error
+if (@mailProfile is null and @emailResults = 1)
+	begin
+		set @errMsg = 'No mail profiles set up--emails can not be sent'
+		raiserror(@errMsg,16,1)
+		return
+	end
+
+
+
+-------------------------------------------------------------------------------------
+--Return the current jobs, steps, schedules, etc... 
+--this includes a few more columns than the alerting mode
+-------------------------------------------------------------------------------------
+
+if @onlyChanges = 0
+
+begin
+	select
+		jobs.job_id
+		,job_name = jobs.name
+		,job_desc = jobs.description
+		,jobs.enabled
+		,jobs.date_created
+		,jobs.date_modified
+		,jobs.version_number
+		,jobs.start_step_id						--ID of the step in the job where execution should begin
+		,job_owner = serv_princ.name			--Security identifier number (SID) of the job owner, to check if job now owned by SA --need to work on this
+		,notify_level_eventlog =	case
+										when jobs.notify_level_eventlog = 0 then 'Never'
+										when jobs.notify_level_eventlog = 1 then 'When the job succeeds'
+										when jobs.notify_level_eventlog = 2 then 'When the job fails'
+										when jobs.notify_level_eventlog = 3 then 'When the job completes (regardless of outcome)'
+									end
+		,notify_level_email =	case
+									when jobs.notify_level_email = 0 then 'Never'
+									when jobs.notify_level_email = 1 then 'When the job succeeds'
+									when jobs.notify_level_email = 2 then 'When the job fails'
+									when jobs.notify_level_email = 3 then 'When the job completes (regardless of outcome)'
+								end
+		,email_operator_name = emailop.name
+		,email_operator_email = emailop.email_address
+		,email_operator_enabled = emailop.enabled
+		,level_page =	case
+							when jobs.notify_level_page = 0 then 'Never'
+							when jobs.notify_level_page = 1 then 'When the job succeeds'
+							when jobs.notify_level_page = 2 then 'When the job fails'
+							when jobs.notify_level_page = 3 then 'When the job completes (regardless of outcome)'
+						end
+		,page_operator_name = pageop.name
+		,page_operator_address = pageop.pager_address
+		,page_operator_enabled = pageop.enabled
+		,page_operator_scheduled_days = SUBSTRING(
+													  CASE WHEN pageop.pager_days &  1 =  1 THEN ',Sun' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  2 =  2 THEN ',Mon' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  4 =  4 THEN ',Tues' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  8 =  8 THEN ',Wed' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 16 = 16 THEN ',Thurs' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 32 = 32 THEN ',Fri' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 64 = 64 THEN ',Sat' ELSE '' END
+												, 2, 64)
+												
+		,page_operator_weekday_sked = stuff(stuff(right('00000' + cast(pageop.weekday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.weekday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,page_operator_saturday_sked = stuff(stuff(right('00000' + cast(pageop.saturday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.saturday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,page_operator_sunday_sked = stuff(stuff(right('00000' + cast(pageop.sunday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.sunday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,steps.step_id
+		,steps.step_name
+		,steps.command
+		,on_success_action =	case
+									when steps.on_success_action = 1 then 'Quit reporting success'
+									when steps.on_success_action = 2 then 'Quit reporting failure'
+									when steps.on_success_action = 3 then 'Go to next step (' + cast(steps.step_id + 1 as varchar) + ')'
+									when steps.on_success_action = 4 then 'Go to step: ' + cast(on_fail_step_id as varchar)
+								end
+		,on_fail_action	=	case
+									when steps.on_fail_action = 1 then 'Quit reporting success'
+									when steps.on_fail_action = 2 then 'Quit reporting failure'
+									when steps.on_fail_action = 3 then 'Go to next step (' + cast(steps.step_id + 1 as varchar) + ')'
+									when steps.on_fail_action = 4 then 'Go to step: ' + cast(on_fail_step_id as varchar)
+								end
+		,last_run_outcome = case
+								when steps.last_run_outcome	= 0 then 'Failed'
+								when steps.last_run_outcome	= 1 then 'Succeeded'
+								when steps.last_run_outcome	= 2 then 'Retry'
+								when steps.last_run_outcome	= 3 then 'Canceled'
+								when steps.last_run_outcome	= 5 then 'Unknown'
+							else 'Undefined'
+							end
+		,last_run_date = case when steps.last_run_date = 0 then 'Never' else stuff(stuff(steps.last_run_date,5,0,'-'),8,0,'-') end 
+		,last_run_time = stuff(stuff(right('00000' + cast(steps.last_run_time as varchar),6),3,0,':'),6,0,':')
+		,last_run_duration = stuff(stuff(right('00000' + cast(steps.last_run_duration as varchar),6),3,0,':'),6,0,':')
+	from 
+		msdb.dbo.sysjobs jobs
+	left join
+		msdb.dbo.sysjobsteps steps on
+		steps.job_id = jobs.job_id
+	left join
+		msdb.dbo.sysoperators emailop on
+		emailop.id = jobs.notify_email_operator_id
+	left join
+		msdb.dbo.sysoperators pageop on
+		pageop.id = jobs.notify_email_operator_id
+	left join
+		sys.server_principals serv_princ on
+		serv_princ.sid = jobs.owner_sid
+
+
+	select 
+		sched.schedule_uid
+		,sched.schedule_id
+		,job_name = jobs.name
+		,job_enabled = jobs.enabled
+		,schedule_name = sched.name
+		,schedule_frequency =	case
+									when sched.freq_type =   1 then 'One time only on ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-') 
+																	+ ' at ' 
+																	+ case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end 
+									when sched.freq_type =   4 then 'Every ' 
+																	+ cast(sched.freq_interval as varchar) 
+																	+ ' days,'  
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =   8 then 'Every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar) 
+																	+ ' weeks on ' 
+																	+ SUBSTRING(
+																				  CASE WHEN sched.freq_interval &  1 =  1 THEN ',Sun' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  2 =  2 THEN ',Mon' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  4 =  4 THEN ',Tues' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  8 =  8 THEN ',Wed' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 16 = 16 THEN ',Thurs' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 32 = 32 THEN ',Fri' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 64 = 64 THEN ',Sat' ELSE '' END
+																			, 2, 64)
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  16 then 'Every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar) 
+																	+ ' months, on day ' 
+																	+ cast(sched.freq_interval as varchar) 
+																	+ ' of that month,'
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  32 then 'Every '
+																	+	case
+																			when sched.freq_relative_interval = 1 then 'first '
+																			when sched.freq_relative_interval = 2 then 'second '
+																			when sched.freq_relative_interval = 4 then 'third '
+																			when sched.freq_relative_interval = 8 then 'fourth '
+																			when sched.freq_relative_interval = 16 then 'last '
+																			else ''
+																		end
+																	+	case 
+																			when sched.freq_interval =  1 then 'Sunday'
+																			when sched.freq_interval =  2 then 'Monday'
+																			when sched.freq_interval =  3 then 'Tuesday'
+																			when sched.freq_interval =  4 then 'Wednesday'
+																			when sched.freq_interval =  5 then 'Thursday'
+																			when sched.freq_interval =  6 then 'Friday'
+																			when sched.freq_interval =  7 then 'Saturday'
+																			when sched.freq_interval =  8 then 'day'
+																			when sched.freq_interval =  9 then 'weekday'
+																			when sched.freq_interval = 10 then 'weekend'
+																		end 
+																	+ ', of every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar)
+																	+ ' months,'
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  64 then 'When SQL Server Agent service starts beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type = 128 then 'When computer is idle beginning '
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+								end
+		,next_run_date =	case 
+								when sched.freq_type =  64 and sched.enabled = 1 then 'When SQL Server Agent service starts' 
+								when sched.freq_type = 128 and sched.enabled = 1 then 'When computer is idle'
+							else 
+								case when jobsched.next_run_date = 0 then 'Never' else stuff(stuff(jobsched.next_run_date,5,0,'-'),8,0,'-') end 
+							end
+		,next_run_time =	case 
+								when sched.freq_type =  64 and sched.enabled = 1 then 'When SQL Server Agent service starts' 
+								when sched.freq_type = 128 and sched.enabled = 1 then 'When computer is idle'
+							else 
+								case when jobsched.next_run_date = 0 then 'Never' else case when jobsched.next_run_time = 0 then '00:00:00' else stuff(stuff(jobsched.next_run_time,3,0,':'),6,0,':') end end
+							end
+		,schedule_enabled = sched.enabled
+		,sched.version_number
+		,sched.date_created
+		,sched.date_modified
+	from
+		msdb.dbo.sysschedules sched
+	inner join 
+		msdb.dbo.sysjobschedules jobsched on
+		jobsched.schedule_id = sched.schedule_id
+	inner join
+		msdb.dbo.sysjobs jobs on
+		jobs.job_id = jobsched.job_id
+end
+
+
+-------------------------------------------------------------------------------------
+--if this is the first time, or we want to re-initalize, populate the history tables
+-------------------------------------------------------------------------------------
+
+if @initalize = 1
+begin
+
+	--check if the table exists, and drop it. Change the DB name to where ever you want to store your history
+	--you'll also need to change it in the `INTO` statement below. I didn't feel like using Dynamic SQL and escaping all the quotes!
+	if exists (select 1 from AdminTools.dbo.sysobjects where name = 'JobScheduleDetails')
+		drop table AdminTools.dbo.JobScheduleDetails
+	if exists (select 1 from AdminTools.dbo.sysobjects where name = 'JobDetails')
+		drop table AdminTools.dbo.JobDetails
+
+	CREATE TABLE AdminTools.dbo.JobScheduleDetails(
+												[schedule_uid] [uniqueidentifier]  NULL,
+												[schedule_id] [int]  NULL,
+												[job_name] [sysname]  NULL,
+												[schedule_name] [sysname]  NULL,
+												[schedule_frequency] [varchar](256) NULL,
+												[schedule_enabled] [int]  NULL,
+												[version_number] [int]  NULL,
+												[date_created] [datetime]  NULL,
+												[date_modified] [datetime]  NULL
+												) ON [PRIMARY]
+	CREATE TABLE AdminTools.dbo.JobDetails(
+										[job_id] [uniqueidentifier] NOT NULL,
+										[job_name] [sysname] NULL,
+										[job_desc] [nvarchar](600) NULL,
+										[enabled] [tinyint]  NULL,
+										[date_created] [datetime] NULL,
+										[date_modified] [datetime] NULL,
+										[version_number] [int] NULL,
+										[start_step_id] [int] NULL,
+										[job_owner] [sysname] NULL,
+										[notify_level_eventlog] [varchar](100) NULL,
+										[notify_level_email] [varchar](100) NULL,
+										[email_operator_name] [sysname] NULL,
+										[email_operator_email] [nvarchar](100) NULL,
+										[email_operator_enabled] [tinyint] NULL,
+										[level_page] [varchar](100) NULL,
+										[page_operator_name] [sysname] NULL,
+										[page_operator_address] [nvarchar](100) NULL,
+										[page_operator_enabled] [tinyint] NULL,
+										[page_operator_scheduled_days] [varchar](50) NULL,
+										[page_operator_weekday_sked] [varchar](100) NULL,
+										[page_operator_saturday_sked] [varchar](100) NULL,
+										[page_operator_sunday_sked] [varchar](100) NULL,
+										[step_id] [int] NULL,
+										[step_name] [sysname] NULL,
+										[command] [nvarchar](max) NULL,
+										[on_success_action] [varchar](64) NULL,
+										[on_fail_action] [varchar](64) NULL
+									) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+
+	insert into AdminTools.dbo.JobDetails
+	select
+		jobs.job_id
+		,job_name = jobs.name
+		,job_desc = jobs.description
+		,jobs.enabled
+		,jobs.date_created
+		,jobs.date_modified
+		,jobs.version_number
+		,jobs.start_step_id						--ID of the step in the job where execution should begin
+		,job_owner = serv_princ.name			--Security identifier number (SID) of the job owner, to check if job now owned by SA --need to work on this
+		,notify_level_eventlog =	case
+										when jobs.notify_level_eventlog = 0 then 'Never'
+										when jobs.notify_level_eventlog = 1 then 'When the job succeeds'
+										when jobs.notify_level_eventlog = 2 then 'When the job fails'
+										when jobs.notify_level_eventlog = 3 then 'When the job completes (regardless of outcome)'
+									end
+		,notify_level_email =	case
+									when jobs.notify_level_email = 0 then 'Never'
+									when jobs.notify_level_email = 1 then 'When the job succeeds'
+									when jobs.notify_level_email = 2 then 'When the job fails'
+									when jobs.notify_level_email = 3 then 'When the job completes (regardless of outcome)'
+								end
+		,email_operator_name = emailop.name
+		,email_operator_email = emailop.email_address
+		,email_operator_enabled = emailop.enabled
+		,level_page =	case
+							when jobs.notify_level_page = 0 then 'Never'
+							when jobs.notify_level_page = 1 then 'When the job succeeds'
+							when jobs.notify_level_page = 2 then 'When the job fails'
+							when jobs.notify_level_page = 3 then 'When the job completes (regardless of outcome)'
+						end
+		,page_operator_name = pageop.name
+		,page_operator_address = pageop.pager_address
+		,page_operator_enabled = pageop.enabled
+		,page_operator_scheduled_days = SUBSTRING(
+													  CASE WHEN pageop.pager_days &  1 =  1 THEN ',Sun' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  2 =  2 THEN ',Mon' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  4 =  4 THEN ',Tues' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  8 =  8 THEN ',Wed' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 16 = 16 THEN ',Thurs' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 32 = 32 THEN ',Fri' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 64 = 64 THEN ',Sat' ELSE '' END
+												, 2, 64)
+		,page_operator_weekday_sked = stuff(stuff(right('00000' + cast(pageop.weekday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.weekday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,page_operator_saturday_sked = stuff(stuff(right('00000' + cast(pageop.saturday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.saturday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,page_operator_sunday_sked = stuff(stuff(right('00000' + cast(pageop.sunday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.sunday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,steps.step_id
+		,steps.step_name
+		,steps.command
+		,on_success_action =	case
+									when steps.on_success_action = 1 then 'Quit reporting success'
+									when steps.on_success_action = 2 then 'Quit reporting failure'
+									when steps.on_success_action = 3 then 'Go to next step (' + cast(steps.step_id + 1 as varchar) + ')'
+									when steps.on_success_action = 4 then 'Go to step: ' + cast(on_fail_step_id as varchar)
+								end
+		,on_fail_action	=	case
+									when steps.on_fail_action = 1 then 'Quit reporting success'
+									when steps.on_fail_action = 2 then 'Quit reporting failure'
+									when steps.on_fail_action = 3 then 'Go to next step (' + cast(steps.step_id + 1 as varchar) + ')'
+									when steps.on_fail_action = 4 then 'Go to step: ' + cast(on_fail_step_id as varchar)
+								end
+		--these fields change / aren't static
+		--,last_run_outcome = case
+		--						when steps.last_run_outcome	= 0 then 'Failed'
+		--						when steps.last_run_outcome	= 1 then 'Succeeded'
+		--						when steps.last_run_outcome	= 2 then 'Retry'
+		--						when steps.last_run_outcome	= 3 then 'Canceled'
+		--						when steps.last_run_outcome	= 5 then 'Unknown'
+		--					else 'Undefined'
+		--					end
+		--,steps.last_run_date
+		--,steps.last_run_time
+		--,steps.last_run_duration
+	from 
+		msdb.dbo.sysjobs jobs
+	left join
+		msdb.dbo.sysjobsteps steps on
+		steps.job_id = jobs.job_id
+	left join
+		msdb.dbo.sysoperators emailop on
+		emailop.id = jobs.notify_email_operator_id
+	left join
+		msdb.dbo.sysoperators pageop on
+		pageop.id = jobs.notify_email_operator_id
+	left join
+		sys.server_principals serv_princ on
+		serv_princ.sid = jobs.owner_sid
+
+	insert into AdminTools.dbo.JobScheduleDetails
+	select 
+		sched.schedule_uid
+		,sched.schedule_id
+		,job_name = jobs.name
+		--,job_enabled = jobs.enabled
+		,schedule_name = sched.name
+		,schedule_frequency =	case
+									when sched.freq_type =   1 then 'One time only on ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-') 
+																	+ ' at ' 
+																	+ case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end 
+									when sched.freq_type =   4 then 'Every ' 
+																	+ cast(sched.freq_interval as varchar) 
+																	+ ' days,'  
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =   8 then 'Every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar) 
+																	+ ' weeks on ' 
+																	+ SUBSTRING(
+																				  CASE WHEN sched.freq_interval &  1 =  1 THEN ',Sun' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  2 =  2 THEN ',Mon' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  4 =  4 THEN ',Tues' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  8 =  8 THEN ',Wed' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 16 = 16 THEN ',Thurs' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 32 = 32 THEN ',Fri' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 64 = 64 THEN ',Sat' ELSE '' END
+																			, 2, 64)
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  16 then 'Every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar) 
+																	+ ' months, on day ' 
+																	+ cast(sched.freq_interval as varchar) 
+																	+ ' of that month,'
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  32 then 'Every '
+																	+	case
+																			when sched.freq_relative_interval = 1 then 'first '
+																			when sched.freq_relative_interval = 2 then 'second '
+																			when sched.freq_relative_interval = 4 then 'third '
+																			when sched.freq_relative_interval = 8 then 'fourth '
+																			when sched.freq_relative_interval = 16 then 'last '
+																			else ''
+																		end
+																	+	case 
+																			when sched.freq_interval =  1 then 'Sunday'
+																			when sched.freq_interval =  2 then 'Monday'
+																			when sched.freq_interval =  3 then 'Tuesday'
+																			when sched.freq_interval =  4 then 'Wednesday'
+																			when sched.freq_interval =  5 then 'Thursday'
+																			when sched.freq_interval =  6 then 'Friday'
+																			when sched.freq_interval =  7 then 'Saturday'
+																			when sched.freq_interval =  8 then 'day'
+																			when sched.freq_interval =  9 then 'weekday'
+																			when sched.freq_interval = 10 then 'weekend'
+																		end 
+																	+ ', of every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar)
+																	+ ' months,'
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  64 then 'When SQL Server Agent service starts beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type = 128 then 'When computer is idle beginning '
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+								end
+		--don't bring back these dates because they aren't static from day to day
+		--,next_run_date =	case 
+		--						when sched.freq_type =  64 and sched.enabled = 1 then 'When SQL Server Agent service starts' 
+		--						when sched.freq_type = 128 and sched.enabled = 1 then 'When computer is idle'
+		--					else 
+		--						case when jobsched.next_run_date = 0 then 'Never' else stuff(stuff(jobsched.next_run_date,5,0,'-'),8,0,'-') end 
+		--					end
+		--,next_run_time =	case 
+		--						when sched.freq_type =  64 and sched.enabled = 1 then 'When SQL Server Agent service starts' 
+		--						when sched.freq_type = 128 and sched.enabled = 1 then 'When computer is idle'
+		--					else 
+		--						case when jobsched.next_run_date = 0 then 'Never' else case when jobsched.next_run_time = 0 then '00:00:00' else stuff(stuff(jobsched.next_run_time,3,0,':'),6,0,':') end end
+		--					end
+		,schedule_enabled = sched.enabled
+		,sched.version_number
+		,sched.date_created
+		,sched.date_modified
+	from
+		msdb.dbo.sysschedules sched
+	inner join 
+		msdb.dbo.sysjobschedules jobsched on
+		jobsched.schedule_id = sched.schedule_id
+	inner join
+		msdb.dbo.sysjobs jobs on
+		jobs.job_id = jobsched.job_id
+
+end
+
+-------------------------------------------------------------------------------------
+--if it's not the initalization / first run... then check for changes and send email
+-------------------------------------------------------------------------------------
+
+if (@emailResults = 1 or @onlyChanges = 1)
+
+begin
+		
+	insert into #JobDetails
+	select
+		jobs.job_id
+		,job_name = jobs.name
+		,job_desc = jobs.description
+		,jobs.enabled
+		,jobs.date_created
+		,date_modified = cast(null as datetime)		--we get this later via update... but leave it out to check with except against base table
+		,version_number = cast(null as int)			--we get this later via update... but leave it out to check with except against base table
+		,jobs.start_step_id							--ID of the step in the job where execution should begin
+		,job_owner = serv_princ.name				--Security identifier number (SID) of the job owner, to check if job now owned by SA --need to work on this
+		,notify_level_eventlog =	case
+										when jobs.notify_level_eventlog = 0 then 'Never'
+										when jobs.notify_level_eventlog = 1 then 'When the job succeeds'
+										when jobs.notify_level_eventlog = 2 then 'When the job fails'
+										when jobs.notify_level_eventlog = 3 then 'When the job completes (regardless of outcome)'
+									end
+		,notify_level_email =	case
+									when jobs.notify_level_email = 0 then 'Never'
+									when jobs.notify_level_email = 1 then 'When the job succeeds'
+									when jobs.notify_level_email = 2 then 'When the job fails'
+									when jobs.notify_level_email = 3 then 'When the job completes (regardless of outcome)'
+								end
+		,email_operator_name = emailop.name
+		,email_operator_email = emailop.email_address
+		,email_operator_enabled = emailop.enabled
+		,level_page =	case
+							when jobs.notify_level_page = 0 then 'Never'
+							when jobs.notify_level_page = 1 then 'When the job succeeds'
+							when jobs.notify_level_page = 2 then 'When the job fails'
+							when jobs.notify_level_page = 3 then 'When the job completes (regardless of outcome)'
+						end
+		,page_operator_name = pageop.name
+		,page_operator_address = pageop.pager_address
+		,page_operator_enabled = pageop.enabled
+		,page_operator_scheduled_days = SUBSTRING(
+													  CASE WHEN pageop.pager_days &  1 =  1 THEN ',Sun' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  2 =  2 THEN ',Mon' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  4 =  4 THEN ',Tues' ELSE '' END
+													+ CASE WHEN pageop.pager_days &  8 =  8 THEN ',Wed' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 16 = 16 THEN ',Thurs' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 32 = 32 THEN ',Fri' ELSE '' END
+													+ CASE WHEN pageop.pager_days & 64 = 64 THEN ',Sat' ELSE '' END
+												, 2, 64)
+		,page_operator_weekday_sked = stuff(stuff(right('00000' + cast(pageop.weekday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.weekday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,page_operator_saturday_sked = stuff(stuff(right('00000' + cast(pageop.saturday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.saturday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,page_operator_sunday_sked = stuff(stuff(right('00000' + cast(pageop.sunday_pager_start_time as varchar),6),3,0,':'),6,0,':') + ' - ' + stuff(stuff(right('00000' + cast(pageop.sunday_pager_end_time as varchar),6),3,0,':'),6,0,':')
+		,steps.step_id
+		,steps.step_name
+		,steps.command
+		,on_success_action =	case
+									when steps.on_success_action = 1 then 'Quit reporting success'
+									when steps.on_success_action = 2 then 'Quit reporting failure'
+									when steps.on_success_action = 3 then 'Go to next step (' + cast(steps.step_id + 1 as varchar) + ')'
+									when steps.on_success_action = 4 then 'Go to step: ' + cast(on_fail_step_id as varchar)
+								end
+		,on_fail_action	=	case
+									when steps.on_fail_action = 1 then 'Quit reporting success'
+									when steps.on_fail_action = 2 then 'Quit reporting failure'
+									when steps.on_fail_action = 3 then 'Go to next step (' + cast(steps.step_id + 1 as varchar) + ')'
+									when steps.on_fail_action = 4 then 'Go to step: ' + cast(on_fail_step_id as varchar)
+								end
+		--these fields change / aren't static
+		--,last_run_outcome = case
+		--						when steps.last_run_outcome	= 0 then 'Failed'
+		--						when steps.last_run_outcome	= 1 then 'Succeeded'
+		--						when steps.last_run_outcome	= 2 then 'Retry'
+		--						when steps.last_run_outcome	= 3 then 'Canceled'
+		--						when steps.last_run_outcome	= 5 then 'Unknown'
+		--					else 'Undefined'
+		--					end
+		--,steps.last_run_date
+		--,steps.last_run_time
+		--,steps.last_run_duration
+	from 
+		msdb.dbo.sysjobs jobs
+	left join
+		msdb.dbo.sysjobsteps steps on
+		steps.job_id = jobs.job_id
+	left join
+		msdb.dbo.sysoperators emailop on
+		emailop.id = jobs.notify_email_operator_id
+	left join
+		msdb.dbo.sysoperators pageop on
+		pageop.id = jobs.notify_email_operator_id
+	left join
+		sys.server_principals serv_princ on
+		serv_princ.sid = jobs.owner_sid
+
+
+	except
+
+	select
+		job_id
+		,job_name
+		,job_desc
+		,enabled
+		,date_created
+		,cast(null as datetime)				--date modified. We exclude this because you can change nothing about a job, but if you click OK when closing the job it updates this
+		,cast(null as int)					--version_number. We exclude this because you can change nothing about a job, but if you click OK when closing the job it updates this
+		,start_step_id
+		,job_owner
+		,notify_level_eventlog
+		,notify_level_email
+		,email_operator_name
+		,email_operator_email
+		,email_operator_enabled
+		,level_page
+		,page_operator_name
+		,page_operator_address
+		,page_operator_enabled
+		,page_operator_scheduled_days
+		,page_operator_weekday_sked
+		,page_operator_saturday_sked
+		,page_operator_sunday_sked
+		,step_id
+		,step_name
+		,command
+		,on_success_action
+		,on_fail_action
+	from AdminTools.dbo.JobDetails
+
+
+	--dirty fix to get deleted jobs
+	insert into #JobDetails (job_id,job_name,job_desc,date_modified)
+	select distinct
+		job_id
+		,job_name
+		,job_desc = 'I GOT DELETED' 
+		,getdate()
+	from AdminTools.dbo.JobDetails
+	where job_id not in (select job_id from msdb.dbo.sysjobs)
+		  and job_id not in (select job_id from AdminTools.dbo.JobDetails where job_desc = 'I GOT DELETED')
+
+
+	insert into #JobScheduleDetails
+	select 
+		sched.schedule_uid
+		,sched.schedule_id
+		,job_name = jobs.name
+		--,job_enabled = jobs.enabled
+		,schedule_name = sched.name
+		,schedule_frequency =	case
+									when sched.freq_type =   1 then 'One time only on ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-') 
+																	+ ' at ' 
+																	+ case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end 
+									when sched.freq_type =   4 then 'Every ' 
+																	+ cast(sched.freq_interval as varchar) 
+																	+ ' days,'  
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =   8 then 'Every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar) 
+																	+ ' weeks on ' 
+																	+ SUBSTRING(
+																				  CASE WHEN sched.freq_interval &  1 =  1 THEN ',Sun' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  2 =  2 THEN ',Mon' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  4 =  4 THEN ',Tues' ELSE '' END
+																				+ CASE WHEN sched.freq_interval &  8 =  8 THEN ',Wed' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 16 = 16 THEN ',Thurs' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 32 = 32 THEN ',Fri' ELSE '' END
+																				+ CASE WHEN sched.freq_interval & 64 = 64 THEN ',Sat' ELSE '' END
+																			, 2, 64)
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ', every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  16 then 'Every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar) 
+																	+ ' months, on day ' 
+																	+ cast(sched.freq_interval as varchar) 
+																	+ ' of that month,'
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  32 then 'Every '
+																	+	case
+																			when sched.freq_relative_interval = 1 then 'first '
+																			when sched.freq_relative_interval = 2 then 'second '
+																			when sched.freq_relative_interval = 4 then 'third '
+																			when sched.freq_relative_interval = 8 then 'fourth '
+																			when sched.freq_relative_interval = 16 then 'last '
+																			else ''
+																		end
+																	+	case 
+																			when sched.freq_interval =  1 then 'Sunday'
+																			when sched.freq_interval =  2 then 'Monday'
+																			when sched.freq_interval =  3 then 'Tuesday'
+																			when sched.freq_interval =  4 then 'Wednesday'
+																			when sched.freq_interval =  5 then 'Thursday'
+																			when sched.freq_interval =  6 then 'Friday'
+																			when sched.freq_interval =  7 then 'Saturday'
+																			when sched.freq_interval =  8 then 'day'
+																			when sched.freq_interval =  9 then 'weekday'
+																			when sched.freq_interval = 10 then 'weekend'
+																		end 
+																	+ ', of every ' 
+																	+ cast(sched.freq_recurrence_factor as varchar)
+																	+ ' months,'
+																	+	case 
+																			when sched.freq_subday_type = 1 then ' at '
+																			when sched.freq_subday_type = 2 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' seconds, from '
+																			when sched.freq_subday_type = 4 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' minutes, from '
+																			when sched.freq_subday_type = 8 then ' every ' + cast(sched.freq_subday_interval as varchar) + ' hours, from '
+																		end
+																	+	case 
+																			when sched.freq_subday_type = 1 then case 
+																													when sched.active_start_time = 0 then '00:00:00'
+																													else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':')
+																												 end
+																			else
+																				case when sched.active_start_time = 0 then '00:00:00' else stuff(stuff(sched.active_start_time,3,0,':'),6,0,':') end
+																				+ ' - '
+																				+ case when sched.active_end_time = 0 then '00:00:00'else stuff(stuff(sched.active_end_time,3,0,':'),6,0,':') end
+																		end
+																	+ ' beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type =  64 then 'When SQL Server Agent service starts beginning ' 
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+									when sched.freq_type = 128 then 'When computer is idle beginning '
+																	+ stuff(stuff(sched.active_start_date,5,0,'-'),8,0,'-')
+																	+ ' and ending '
+																	+ case when sched.active_end_date = 99991231 then 'Never' else stuff(stuff(sched.active_end_date,5,0,'-'),8,0,'-') end
+								end
+		--don't bring back these dates because they aren't static from day to day
+		--,next_run_date =	case 
+		--						when sched.freq_type =  64 and sched.enabled = 1 then 'When SQL Server Agent service starts' 
+		--						when sched.freq_type = 128 and sched.enabled = 1 then 'When computer is idle'
+		--					else 
+		--						case when jobsched.next_run_date = 0 then 'Never' else stuff(stuff(jobsched.next_run_date,5,0,'-'),8,0,'-') end 
+		--					end
+		--,next_run_time =	case 
+		--						when sched.freq_type =  64 and sched.enabled = 1 then 'When SQL Server Agent service starts' 
+		--						when sched.freq_type = 128 and sched.enabled = 1 then 'When computer is idle'
+		--					else 
+		--						case when jobsched.next_run_date = 0 then 'Never' else case when jobsched.next_run_time = 0 then '00:00:00' else stuff(stuff(jobsched.next_run_time,3,0,':'),6,0,':') end end
+		--					end
+		,schedule_enabled = sched.enabled
+		,version_number = cast(null as int)					--we get this later via update... but leave it out to check with except against base table
+		,sched.date_created
+		,date_modified = cast(null as datetime)				--we get this later via update... but leave it out to check with except against base table
+	from
+		msdb.dbo.sysschedules sched
+	inner join 
+		msdb.dbo.sysjobschedules jobsched on
+		jobsched.schedule_id = sched.schedule_id
+	inner join
+		msdb.dbo.sysjobs jobs on
+		jobs.job_id = jobsched.job_id
+
+	except 
+
+	select
+		schedule_uid
+		,schedule_id
+		,job_name
+		,schedule_name
+		,schedule_frequency
+		,schedule_enabled
+		,cast(null as int)								--version number
+		,date_created
+		,cast(null as datetime)							--date modified
+	from AdminTools.dbo.JobScheduleDetails
+
+
+	--dirty fix to get deleted job schedules
+	insert into #JobScheduleDetails (schedule_id,job_name,schedule_name,date_modified)
+	select distinct
+		schedule_id
+		,job_name
+		,schedule_name = 'I GOT DELETED' 
+		,getdate()
+	from AdminTools.dbo.JobScheduleDetails
+	where 
+		schedule_id not in (select schedule_id from msdb.dbo.sysschedules)
+		and schedule_id not in (select schedule_id from AdminTools.dbo.JobScheduleDetails where schedule_name = 'I GOT DELETED')
+		
+
+
+	---------------------------------------------------------------------------------------------
+	--Do the work to send email and then insert into the history / admin tool table
+	---------------------------------------------------------------------------------------------
+
+	if exists(select 1 from #JobDetails) and @emailResults = 1
+	begin
+
+		--add the date_modified and version_number
+		update jdt
+			set 
+				date_modified = j.date_modified
+				,version_number = j.version_number
+		from #JobDetails jdt
+		left join msdb.dbo.sysjobs j on
+		j.job_id = jdt.job_id
+
+		--remove this to use a manual method which doesn't require this slick function
+		set @body = 
+			(select AdminTools.dbo.ufn_CreateHTMLTable (
+			(select distinct job_name, enabled, date_created, date_modified from #JobDetails for xml path ('row'),elements xsinil)
+			,null,null,null))
+
+
+		--add some CSS, which does require a CAST but oh well
+		set @body_html =  
+			'<style type="text/css" media="screen,print">
+			.center
+			{
+				text-align: center;
+			}
+			table,th
+			{
+				border: 1px solid black;
+			}
+			table,tr
+			{
+				border: 1px solid black;
+			}
+			table,td
+			{
+				border: 1px solid black;
+			}
+			</style>' 
+			+ cast(@body as varchar(max))
+
+
+
+
+		--send the email
+		set @subject = 'SQL Agent Jobs On ' + @@SERVERNAME + ' Have Changed'
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @mailProfile	
+		,@recipients = @operator_email
+		,@subject = @subject
+		,@body = @body_html
+		,@body_format = 'HTML'
+
+	end
+
+	--repeat for job schedule changes
+	
+	if exists(select 1 from #JobScheduleDetails) and @emailResults = 1
+	begin
+
+		--add the date_modified and version_number
+		update jsd
+			set 
+				date_modified = sched.date_modified
+				,version_number = sched.version_number
+		from #JobScheduleDetails jsd
+		left join msdb.dbo.sysschedules sched
+		on sched.schedule_id = jsd.schedule_id
+
+		--remove this to use a manual method which doesn't require this slick function
+		set @body = 
+			(select AdminTools.dbo.ufn_CreateHTMLTable (
+			(select distinct job_name, schedule_name, schedule_enabled, date_created, date_modified from #JobScheduleDetails for xml path ('row'),elements xsinil)
+			,null,null,null))
+
+
+		--add some CSS, which does require a CAST but oh well
+		set @body_html =  
+			'<style type="text/css" media="screen,print">
+			.center
+			{
+				text-align: center;
+			}
+			table,th
+			{
+				border: 1px solid black;
+			}
+			table,tr
+			{
+				border: 1px solid black;
+			}
+			table,td
+			{
+				border: 1px solid black;
+			}
+			</style>' 
+			+ cast(@body as varchar(max))
+
+
+		--send the email
+		set @subject = 'SQL Agent Job Schedules On ' + @@SERVERNAME + ' Have Changed'
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @mailProfile	
+		,@recipients = @operator_email
+		,@subject = @subject
+		,@body = @body_html
+		,@body_format = 'HTML'
+
+	end
+
+	---------------------------------------------------------------------------------------------
+	--return results if you don't want them emailed
+	---------------------------------------------------------------------------------------------
+	if (@emailResults = 0 and @onlyChanges = 1)
+	
+	update jsd
+	set 
+		date_modified = sched.date_modified
+		,version_number = sched.version_number
+	from #JobScheduleDetails jsd
+	left join msdb.dbo.sysschedules sched
+	on sched.schedule_id = jsd.schedule_id
+
+
+
+	update jdt
+	set 
+		date_modified = j.date_modified
+		,version_number = j.version_number
+	from #JobDetails jdt
+	left join msdb.dbo.sysjobs j on
+	j.job_id = jdt.job_id
+
+	select  * from #JobDetails
+	select * from #JobScheduleDetails
+
+end
+
+
+---------------------------------------------------------------------------------------------
+--Log the changes
+---------------------------------------------------------------------------------------------
+insert into AdminTools.dbo.JobScheduleDetails
+select * from #JobScheduleDetails
+
+insert into AdminTools.dbo.JobDetails
+select * from #JobDetails
