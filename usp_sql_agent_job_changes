@@ -11,6 +11,7 @@ every single change. You could run this ever x minutes to use it as psudo auditi
 
 
 2018-05-15		S.Simon		Created Proc
+2018-05-23		S.Simon		Aded logic to update the history table if wanted, fixed bug on email
 
 ***********************************************************************************************************************/
 
@@ -22,6 +23,7 @@ create procedure usp_sql_agent_job_changes(	 @emailResults bit = 0
 											,@email varchar(4000) = null
 											,@initalize bit = 0
 											,@onlyChanges bit = 1
+											,@logChanges bit = 1
 											)
 as
 
@@ -32,7 +34,7 @@ as
 ----declare @email varchar(4000) = 'email@domain.com'							--email address / addresses to send email to. @operator email used if both passed in
 ----declare @initalize bit = 0													--set to 1 if you want the tables dropped, recreated and initally populated
 ----declare @onlyChanges bit = 1												--set to 0 if you want to just return all jobs, steps, schedules etc (running from SSMS or something). This doens't work with @emailResults = 1. It won't email
-
+----declare @logChanges bit = 1													--set to 1 if you want to log / update the history table (usually the case unless testing) 
 
 
 
@@ -1271,8 +1273,11 @@ end
 ---------------------------------------------------------------------------------------------
 --Log the changes
 ---------------------------------------------------------------------------------------------
-insert into AdminTools.dbo.JobScheduleDetails
-select * from #JobScheduleDetails
+if @logChanges = 1
+begin
+	insert into AdminTools.dbo.JobScheduleDetails
+	select * from #JobScheduleDetails
 
-insert into AdminTools.dbo.JobDetails
-select * from #JobDetails
+	insert into AdminTools.dbo.JobDetails
+	select * from #JobDetails
+end
