@@ -1,0 +1,368 @@
+use AdminTools
+go
+
+/**************************************************************************************************************
+Procedure to check for sql agent alert changes and send an email with the changes.
+Also logs the changes, so you can always query the "history" tables get the changes
+
+NOTE: This isn't an auditing feature unless ran very often
+
+2018-05-23		S.Simon		Created Proc
+
+***************************************************************************************************************/
+
+create procedure usp_sql_agent_alert_changes(	@emailResults bit = 0
+												,@mailProfile varchar(256) = null
+												,@operator varchar(256) = null
+												,@email varchar(4000) = null	
+												,@initalize bit = 0	
+												,@onlyChanges bit = 1
+												,@logChanges bit = 1
+												)
+as
+
+------user variables for testing
+----declare @emailResults bit = 1												--1 emails results, 0 doesn't
+----declare @mailProfile varchar(256) = null									--mail profile used for sp_send_dbmail. We get a profile if left null, with default profile as precedence 
+----declare @operator varchar(256) = null										--operator profile to send the email to
+----declare @email varchar(4000) = 'email@domain.com'							--email address / addresses to send email to. @operator email used if both passed in
+----declare @initalize bit = 0													--set to 1 if you want the tables dropped, recreated and initally populated
+----declare @onlyChanges bit = 1												--set to 0 if you want to just return all jobs, steps, schedules etc (running from SSMS or something). This doens't work with @emailResults = 1. It won't email
+----declare @logChanges bit = 1													--set to 1 if you want to log / update the history table (usually the case unless testing)
+
+
+---------------------------------------------------------------------------------
+--don't send emails if you want everything returned, and don't initalize
+---------------------------------------------------------------------------------
+
+if (@onlyChanges = 0)
+begin
+	set @emailResults = 0
+end
+
+
+---------------------------------------------------------------------------------
+--if you are initalizing, don't send email either (but do return current state)
+---------------------------------------------------------------------------------
+if (@initalize = 1)
+begin
+	set @emailResults = 0
+	set @onlyChanges = 0
+end
+
+
+---------------------------------------------------------------------------------
+--only email the changes, and don't override
+---------------------------------------------------------------------------------
+if (@emailResults = 1)
+begin
+	set @onlyChanges = 1
+	set @initalize = 0
+end	
+
+
+---------------------------------------------------------------------------------
+--static tables
+---------------------------------------------------------------------------------
+declare @subject varchar(2000) = null										--is set staticially before emails are sent, depending on the change
+declare @body xml = null													--used to build out the table dynamically
+declare @body_html varchar(max) = null										--used to add CSS so i don't edit the function--and there's probably a better way
+declare @errMsg varchar(600) = null
+
+
+
+---------------------------------------------------------------------------------
+--Temp table to hold some results
+---------------------------------------------------------------------------------
+
+if object_id('tempdb..#AlertDetails') is not null
+drop table #AlertDetails
+
+create table #AlertDetails(
+							alert_id int null
+							,alert_name sysname null
+							,message_id int null
+							,severity int null
+							,is_enabled tinyint null
+							,delay_seconds_between_responses int null
+							,notification_message varchar(512)
+							,include_event_description varchar(512)
+							,database_name nvarchar(512) null
+							,event_description_keyword nvarchar(100)
+							,job_name sysname null
+							,num_operators_alert int null
+							,category_name sysname null
+							,captured_date datetime null
+							,comments varchar(256) null)
+
+
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+
+if(@operator is null and @email is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
+end
+else
+begin
+	declare @operator_email varchar(256) = coalesce(@email,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			set @errMsg = 'No email address set for operator' + @operator
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+---------------------------------------------------------------------------------
+--get the default @mailProfile for db_mail if one isn't passed in
+---------------------------------------------------------------------------------
+
+if @mailProfile is null and @emailResults = 1
+begin
+
+	--exec msdb.dbo.sysmail_help_profile_sp 
+	--exec msdb.dbo.sysmail_help_account_sp 
+
+	if object_id('tempdb..#profile') is not null drop table #profile
+	create table #profile (  principal_id int
+							,principal_name varchar(256)
+							,profile_id int
+							,profile_name varchar(256)
+							,is_default bit)
+
+	insert into #profile
+	exec msdb.dbo.sysmail_help_principalprofile_sp  
+
+	set @mailProfile = (select top 1 profile_name from #profile where is_default = 1)
+end
+
+
+--suppose they didn't set a default? Get an arbritary one...
+
+if @mailProfile is null and @emailResults = 1
+begin
+	set @mailProfile = (select top 1 profile_name from #profile)
+end
+
+--still nada? throw an error
+if (@mailProfile is null and @emailResults = 1)
+	begin
+		set @errMsg = 'No mail profiles set up--emails can not be sent'
+		raiserror(@errMsg,16,1)
+		return
+	end
+
+-------------------------------------------------------------------------------------
+--if we are initalizing, create the tables and populate them
+-------------------------------------------------------------------------------------
+
+if @initalize = 1
+begin
+	
+	if exists (select 1 from AdminTools.dbo.sysobjects where name = 'AlertDetails')
+		drop table AdminTools.dbo.AlertDetails
+
+	create table AdminTools.dbo.AlertDetails(alert_id int null
+											,alert_name sysname null
+											,message_id int null
+											,severity int null
+											,is_enabled tinyint null
+											,delay_seconds_between_responses int null
+											,notification_message varchar(512)
+											,include_event_description varchar(512) null
+											,database_name nvarchar(512) null
+											,event_description_keyword nvarchar(100)
+											,job_name sysname null
+											,num_operators_alert int null
+											,category_name sysname null
+											,captured_date datetime null
+											,comments varchar(256) null)
+
+
+	insert into AdminTools.dbo.AlertDetails
+	select
+		alert_id = a.id
+		,alert_name = a.name
+		,a.message_id
+		,a.severity
+		,is_enabled = a.enabled
+		,delay_seconds_between_responses = a.delay_between_responses
+		,a.notification_message
+		,include_event_description = case
+										when a.include_event_description = 0 then 'no message'
+										when a.include_event_description = 1 then 'email'
+										when a.include_event_description = 2 then 'pager'
+										when a.include_event_description = 3 then 'pager and email'
+										when a.include_event_description = 4 then 'net send'
+										when a.include_event_description = 5 then 'net send and email'
+										when a.include_event_description = 6 then 'net send and pager'
+										when a.include_event_description = 7 then 'net send, pager, and email'
+									 end
+		,a.database_name
+		,a.event_description_keyword
+		,job_name = j.name
+		,num_operators_alert = a.has_notification
+		,category_name = c.name
+		,getdate()
+		,comments = null
+	from
+		msdb.dbo.sysalerts a
+	left join
+		msdb.dbo.sysjobs j on
+		j.job_id = a.job_id
+	left join 
+		msdb.dbo.syscategories c on
+		c.category_id = a.category_id
+
+end
+
+
+-------------------------------------------------------------------------------------
+--if it's not the initalization / first run... then check for changes and send email
+-------------------------------------------------------------------------------------
+if (@emailResults = 1 or @onlyChanges = 1)
+begin
+
+	insert into #AlertDetails
+	select
+		alert_id = a.id
+		,alert_name = a.name
+		,a.message_id
+		,a.severity
+		,is_enabled = a.enabled
+		,delay_seconds_between_responses = a.delay_between_responses
+		,a.notification_message
+		,include_event_description = case
+										when a.include_event_description = 0 then 'no message'
+										when a.include_event_description = 1 then 'email'
+										when a.include_event_description = 2 then 'pager'
+										when a.include_event_description = 3 then 'pager and email'
+										when a.include_event_description = 4 then 'net send'
+										when a.include_event_description = 5 then 'net send and email'
+										when a.include_event_description = 6 then 'net send and pager'
+										when a.include_event_description = 7 then 'net send, pager, and email'
+									 end
+		,a.database_name
+		,a.event_description_keyword
+		,job_name = j.name
+		,num_operators_alert = a.has_notification
+		,category_name = c.name
+		,captured_date = null
+		,comments = null
+	from
+		msdb.dbo.sysalerts a
+	left join
+		msdb.dbo.sysjobs j on
+		j.job_id = a.job_id
+	left join 
+		msdb.dbo.syscategories c on
+		c.category_id = a.category_id
+
+
+	except
+
+	select
+		alert_id
+		,alert_name
+		,message_id
+		,severity
+		,is_enabled
+		,delay_seconds_between_responses
+		,notification_message
+		,include_event_description
+		,database_name
+		,event_description_keyword
+		,job_name
+		,num_operators_alert
+		,category_name 
+		,captured_date = null
+		,comments
+	from AdminTools.dbo.AlertDetails
+
+
+	--dirty fix to get deleted Alerts
+	insert into #AlertDetails (alert_id, alert_name, captured_date, comments)
+	select distinct
+		alert_id
+		,alert_name
+		,captured_date = getdate()
+		,comments = 'I GOT DELETED'
+	from
+		AdminTools.dbo.AlertDetails
+	where
+		alert_id not in (select id from msdb.dbo.sysalerts)
+		and alert_id not in (select alert_id from AdminTools.dbo.AlertDetails where comments = 'I GOT DELETED')
+
+
+
+	---------------------------------------------------------------------------------------------
+	--Do the work to send email and then insert into the history / admin tool table
+	---------------------------------------------------------------------------------------------
+
+	if exists(select 1 from #AlertDetails) and @emailResults = 1
+	begin
+		
+		set @body = 
+			(select AdminTools.dbo.ufn_CreateHTMLTable (
+			(select distinct alert_name, is_enabled, comments from #AlertDetails for xml path ('row'),elements xsinil)
+			,null,null,null))	
+			
+			
+		--add some CSS, which does require a CAST but oh well
+		set @body_html =  
+			'<style type="text/css" media="screen,print">
+			.center
+			{
+				text-align: center;
+			}
+			table,th
+			{
+				border: 1px solid black;
+			}
+			table,tr
+			{
+				border: 1px solid black;
+			}
+			table,td
+			{
+				border: 1px solid black;
+			}
+			</style>' 
+			+ cast(@body as varchar(max))	
+
+
+		--send the email
+		set @subject = 'SQL Agent Alerts On ' + @@SERVERNAME + ' Have Changed'
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @mailProfile	
+		,@recipients = @operator_email
+		,@subject = @subject
+		,@body = @body_html
+		,@body_format = 'HTML'
+
+	end
+
+	---------------------------------------------------------------------------------------------
+	--return results if you don't want them emailed
+	---------------------------------------------------------------------------------------------
+
+	if (@emailResults = 0 and @onlyChanges = 1)
+	begin
+		select * from #AlertDetails
+	end
+
+end
+
+if @logChanges = 1
+begin
+	insert into AdminTools.dbo.AlertDetails
+	select * from #AlertDetails
+end
+
