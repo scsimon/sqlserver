@@ -1142,7 +1142,7 @@ begin
 		--remove this to use a manual method which doesn't require this slick function
 		set @body = 
 			(select AdminTools.dbo.ufn_CreateHTMLTable (
-			(select distinct job_name, enabled, date_created, date_modified from #JobDetails for xml path ('row'),elements xsinil)
+			(select distinct job_name, enabled, job_desc = case when job_desc != 'I GOT DELETED' then '' else job_desc end, date_created, date_modified from #JobDetails for xml path ('row'),elements xsinil)
 			,null,null,null))
 
 
