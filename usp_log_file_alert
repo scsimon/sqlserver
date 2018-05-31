@@ -1,7 +1,6 @@
 USE [AdminTools]
 GO
 
-/****** Object:  StoredProcedure [dbo].[usp_log_file_alert]    Script Date: 05/15/2018 11:19:52 AM ******/
 SET ANSI_NULLS ON
 GO
 
@@ -19,7 +18,13 @@ Note, data file growth is seperate from this procedure's purpose entirely, and a
 which is consuming the most pages in tempdb isn't necessairly the culprit that is preventing
 the log from releasing space.
 
+
+//TODO	Find out how to send formatted query in the html build
+//TODO	Change error handleing on auto-shrink to segment TRY block
+
+
 2018-05-15		S.Simon		Created Proc
+2018-05-29		S.Simon		Added ability to auto kill the SPID, and auto shrink the log file
 *************************************************************************************************/
 
 
@@ -29,6 +34,12 @@ ALTER procedure [dbo].[usp_log_file_alert]( @database varchar(256) = 'tempdb'
 									 ,@operator varchar(256) = null										
 									 ,@email varchar(4000) = null							
 									 ,@emailResults bit = 0
+									 ,@autoKill bit = 0
+									 ,@autoKillTranTime int = null
+									 ,@autoKillLine int = null
+									 ,@autoShrink bit = 0
+									 ,@autoShrinkLine int = null
+									 ,@autoShrinkToMB int = null
 									 )
 as
 
@@ -37,7 +48,29 @@ as
 --declare @mailProfile varchar(256) = null									--mail profile used for sp_send_dbmail. We get a profile if left null, with default profile as precedence 
 --declare @operator varchar(256) = null										--operator profile to send the email to
 --declare @email varchar(4000) = 'email@domain.com'							--email address / addresses to send email to. @operator email used if both passed in
---declare @emailResults bit = 0
+--declare @emailResults bit = 1												--flag to or return results
+
+--declare @autoKill bit = 1													--flag to auto kill
+--declare @autoKillTranTime int = 1											--number of minutes a tran has to be open for before it's auto killed (i.e. don't just kill any tran, idea is to get a hung / uncommited transaction)
+--declare @autoKillLine int = 40												--size in MB the log file has to be for the SPID to be killed
+
+--declare @autoShrink bit = 1													--flag to auto shrink
+--declare @autoShrinkLine int = 40											--size in MB the log file has to be >= in order to be shrunk
+--declare @autoShrinkToMB int = 10											--size in MB to shrink to
+
+
+
+
+
+-----------------------------------------------------------------------------
+--check to see if there is more than 1 log file. Don't use auto shrink if so
+-----------------------------------------------------------------------------
+
+if  @autoShrink = 1 and (select count(name) from sys.master_files where DB_NAME(database_id) = @database and type_desc = 'LOG') > 1
+begin
+	raiserror('This proc can not handle auto-shrinking multiple log files, and you shoud not have more than one anyways. Ask Paul Randal',16,1)
+	return
+end
 
 -----------------------------------------------------------------------------
 --variables for email, and other places in proc
@@ -53,6 +86,31 @@ declare @SPID varchar(16)
 declare @datetime varchar(64)
 declare @badguy varchar(max) = ''
 declare @badquery varchar(max) = ''
+declare @logFileName varchar(4000) = (select name from sys.master_files where DB_NAME(database_id) = @database and type_desc = 'LOG')
+declare @currentSizeMB int
+declare @shrinkMessage varchar(max) = 'Auto shrink of the log file was not attempted' 
+declare @killMessage varchar(max) = 'Auto kill of the SPID was not attempted'
+
+
+
+
+-----------------------------------------------------------------------------
+--Handle some error handeling
+-----------------------------------------------------------------------------
+if @autoShrink = 1 and (@autoShrinkLine is null or @autoShrinkToMB is null)
+begin
+	set @errMsg = '@autoShrinkLine & @autoShrinkToMB parameters are required when @autoShrink = 1'
+	raiserror(@errMsg,16,1)
+	return
+end
+
+if @autoKill = 1 and (@autoKillTranTime is null or  @autoKillLine is null)
+begin
+	set @errMsg = '@autoKillTranTime & @autoKillLine parameters are required when @autoKill = 1'
+	raiserror(@errMsg,16,1)
+	return
+end
+
 
 ---------------------------------------------------------------------------------
 --get @operator email if the param was used, otherwise use @email
@@ -158,6 +216,8 @@ begin
 	(select DatabaseName, LogSizeMB, LogSpaceUsedPercentage, [status] from #logspace for xml path ('row'),elements xsinil)
 	,null,null,null))
 
+	set @currentSizeMB = (select LogSizeMB from #logspace where DatabaseName = @database)
+
 end
 
 -----------------------------------------------------------------------------
@@ -192,7 +252,10 @@ begin
 	(select DatabaseName, LogSizeMB, UsedLogSizeMB, LogSpaceUsedPercentage from #logspaceusage for xml path ('row'),elements xsinil)
 	,null,null,null))
 
+	set @currentSizeMB = (select LogSizeMB from #logspaceusage)
+
 end
+
 
 -----------------------------------------------------------------------------
 --Get some sp_WhoIsActive
@@ -216,21 +279,83 @@ begin
 
 	set @badguy =	(select cast(login_name as varchar(256)) from #whoIsActive) 
 					+ ' executed the query below via '
-					+ (select cast(isnull([program_name],'') as varchar(4000)) from #whoIsActive)
+					+ (select cast(isnull([program_name],'???') as varchar(4000)) from #whoIsActive)
 					+ ' from '
-					+ (select cast(isnull([host_name],'') as varchar(1000)) from #whoIsActive)
+					+ (select cast(isnull([host_name],'???') as varchar(1000)) from #whoIsActive)
 					+ '. The transaction is currently '
-					+ (select cast(isnull(tran_status,'') as varchar(64)) from #whoIsActive)
+					+ (select cast(isnull(tran_status,'???') as varchar(64)) from #whoIsActive)
 					+ ' and has been running for '
-					+ (select cast(run_time as varchar(16)) from #whoIsActive)
+					+ (select cast(isnull(run_time,'???') as varchar(16)) from #whoIsActive)
 					+ '.'
 
 	set @badquery = (select replace(replace(cast(isnull(sql_text,'') as varchar(max)),'<',''),'>','') from #whoIsActive)
-			
-	--todo... find out how to send formatted query in the html build
-	--set @badquery = (select cast(sql_text as varchar(max)) from #whoIsActive)
-			
+				
 end
+
+
+
+-----------------------------------------------------------------------------
+--if @autoKill enabled, and the tran is running for longer than the threshold
+--and the logFile is above our threshold then we kill it as a fail safe
+-----------------------------------------------------------------------------
+
+if (@autoKill = 1 and datediff(minute,@datetime,getdate()) > @autoKillTranTime and @currentSizeMB >= @autoKillLine)
+begin try
+	declare @kill varchar(64)
+	set @kill = 'kill ' + cast(@SPID as varchar)
+	exec(@kill)
+	
+	set @killMessage = 'SPID: ' + cast(@SPID as varchar) + ' /  USER: ' + isnull((select cast(login_name as varchar(256)) from #whoIsActive),'UNK USER') + ' was auto-killed'
+end try
+begin catch
+	set @killMessage = 'Attempt to auto-kill SPID: ' + isnull(cast(@SPID as varchar),'NO SPID') + ' /  USER: ' + isnull((select cast(login_name as varchar(256)) from #whoIsActive),'UNK USER') + ' failed. Error: ' + isnull((select ERROR_MESSAGE()),'UNK ERROR')
+end catch
+
+
+-----------------------------------------------------------------------------
+--if @auto shrink flag is enabled and the currentSize is >= the threshold
+--attempt to shrink the log file
+--make sure the SPID was killed first
+-----------------------------------------------------------------------------
+if (@autoShrink = 1 and @currentSizeMB >= @autoShrinkLine and @autoKill = 1 and left(@killMessage,4) = 'SPID')
+begin try
+	declare @shrinkSQL varchar(max)
+	declare @i int = 1
+	declare @newSizeSQL varchar(max) 
+	declare @newSizeMB table (newSize varchar(16))
+	
+	--attempt the shrink 3 times, giving time for transactions to roll back
+	while @i <= 3
+	begin
+		--give the db time to kill the transaction
+		waitfor delay '00:00:05'
+	
+		set @shrinkSQL = 'use ' + @database + char(13) + 
+			'dbcc shrinkfile (' + @logFileName + ', ' + cast(@autoShrinkToMB as varchar) + ')'
+		--print @shrinkSQL
+		exec(@shrinkSQL)
+
+		set @newSizeSQL  = 'use [' + @database + '] select cast(cast(total_log_size_in_bytes / 1048576.0 as int) as varchar) from sys.dm_db_log_space_usage'
+		delete from @newSizeMB where 1=1
+		insert into @newSizeMB exec(@newSizeSQL)
+
+		set @shrinkMessage = @database + ' shrink log file command ran to reduce the size from ' + cast(@currentSizeMB as varchar) + 'MB to ' + cast(@autoShrinkToMB as varchar) + 'MB. The current size is ' + (select top 1 * from @newSizeMB) + 'MB'
+
+		if (select top 1 cast(newSize as int) from @newSizeMB)  >= @currentSizeMB
+		begin
+			--need to try the shrink again
+			set @i = @i + 1
+		end
+		else
+			--shrink worked
+			set @i = 100
+	end
+end try
+begin catch
+	set @shrinkMessage = 'A problem occurred  attempting to shrink ' + @logFileName + ' on ' + @database + ' The shrink may have occured, but the error is: ' + isnull((select ERROR_MESSAGE()),'UNK ERROR')
+end catch
+
+
 
 
 -----------------------------------------------------------------------------
@@ -269,16 +394,27 @@ begin
 					+ '<br></br>'
 					+ @badguy
 					+ '<br></br>'
+					+ @killMessage
+					+ '<br></br>'
+					+ @shrinkMessage
+					+ '<br></br>'
 					+ @badquery
 					+ '<br></br>'
 
-	--catch all just in case
-	if (@body_html is null)
+
+	
+	--No active transactions?
+	if (@SPID is null)
 	begin
-		set @body_html = '<H3>The alert procedure encounted an error... manually troubleshoot the log file growth with dbcc opentran(''' + @database + '''), sp_WhoIsActive, and dbcc sqlperf(''logspace'')</H3>'
+		set @body_html = '<H3> There are no active transactions running against ' + @database + ' on ' + @@SERVERNAME + '</H3>'
 	end
 
-
+	--catch all
+	if (@body_html is null)
+	begin
+		set @body_html = '<H3>The alert procedure encounted an error. Manually troubleshoot the log file growth with dbcc opentran(''' + @database + '''), sp_WhoIsActive, and dbcc sqlperf(''logspace'') and shrink the log file to stop alerts</H3>'
+	end
+	
 		
 	--send the email
 	set @subject = 'Log File Size Alert for ' + @database + ' on ' + @@SERVERNAME
@@ -306,6 +442,8 @@ begin
 		select * from #opentran
 	if object_id('tempdb..#whoIsActive') is not null 
 		select * from #whoIsActive
+	select @killMessage
+	select @shrinkMessage
 end
 
 
