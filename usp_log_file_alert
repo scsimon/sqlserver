@@ -293,13 +293,13 @@ begin
 end
 
 
-
 -----------------------------------------------------------------------------
 --if @autoKill enabled, and the tran is running for longer than the threshold
+--and the @spid isn't a system spid
 --and the logFile is above our threshold then we kill it as a fail safe
 -----------------------------------------------------------------------------
 
-if (@autoKill = 1 and datediff(minute,@datetime,getdate()) > @autoKillTranTime and @currentSizeMB >= @autoKillLine)
+if (@autoKill = 1 and datediff(minute,@datetime,getdate()) > @autoKillTranTime and @currentSizeMB >= @autoKillLine and @SPID not in (select session_id from sys.dm_exec_sessions where is_user_process = 0))
 begin try
 	declare @kill varchar(64)
 	set @kill = 'kill ' + cast(@SPID as varchar)
@@ -310,6 +310,16 @@ end try
 begin catch
 	set @killMessage = 'Attempt to auto-kill SPID: ' + isnull(cast(@SPID as varchar),'NO SPID') + ' /  USER: ' + isnull((select cast(login_name as varchar(256)) from #whoIsActive),'UNK USER') + ' failed. Error: ' + isnull((select ERROR_MESSAGE()),'UNK ERROR')
 end catch
+
+
+
+-----------------------------------------------------------------------------
+--Kill message for system SPID (we don't't kill them)
+-----------------------------------------------------------------------------
+if (@autoKill = 1 and datediff(minute,@datetime,getdate()) > @autoKillTranTime and @currentSizeMB >= @autoKillLine and @SPID in (select session_id from sys.dm_exec_sessions where is_user_process = 0))
+begin
+	set @killMessage = 'This is a system SPID, thus it was not killed'
+end
 
 
 -----------------------------------------------------------------------------
