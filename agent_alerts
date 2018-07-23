@@ -128,3 +128,62 @@ GO
 
 EXEC msdb.dbo.sp_add_notification @alert_name=N'Error Number 825', @operator_name=N'DBA_ALERT', @notification_method = 3;
 GO
+
+
+EXEC msdb.dbo.sp_add_alert @name=N'Error Number 856', 
+		@message_id=856, 
+		@severity=0, 
+		@enabled=1, 
+		@delay_between_responses=1800, 
+		@include_event_description_in=1, 
+		@notification_message=N'Hardware memory corruption detected', 
+		@job_id=N'00000000-0000-0000-0000-000000000000'
+GO
+
+
+EXEC msdb.dbo.sp_add_notification @alert_name=N'Error Number 856', @operator_name=N'DBA_ALERT', @notification_method = 3;
+GO
+
+EXEC msdb.dbo.sp_add_alert @name=N'Error Number 855', 
+		@message_id=855, 
+		@severity=0, 
+		@enabled=1, 
+		@delay_between_responses=1800, 
+		@include_event_description_in=1, 
+		@notification_message=N'Uncorrectable hardware memory corruption detected. Check windows event log.', 
+		@job_id=N'00000000-0000-0000-0000-000000000000'
+GO
+
+
+EXEC msdb.dbo.sp_add_notification @alert_name=N'Error Number 855', @operator_name=N'DBA_ALERT', @notification_method = 3;
+GO
+
+
+EXEC msdb.dbo.sp_add_alert @name=N'Error Number 832', 
+		@message_id=832, 
+		@severity=0, 
+		@enabled=1, 
+		@delay_between_responses=0, 
+		@include_event_description_in=1, 
+		@notification_message=N'Probably memory or OS corruption.   https://www.sqlskills.com/blogs/paul/dont-confuse-error-823-and-error-832/', 
+		@job_id=N'00000000-0000-0000-0000-000000000000'
+GO
+
+EXEC msdb.dbo.sp_add_notification @alert_name=N'Error Number 832', @operator_name=N'DBA_ALERT', @notification_method = 3;
+GO
+
+
+
+EXEC msdb.dbo.sp_add_alert @name=N'Error Number 829', 
+		@message_id=829, 
+		@severity=0, 
+		@enabled=1, 
+		@delay_between_responses=1800, 
+		@include_event_description_in=1, 
+		@notification_message=N'A page has been marked as restore pending (Automatic Page Repair for suspect / corrupt pages)', 
+		@job_id=N'00000000-0000-0000-0000-000000000000'
+GO
+
+EXEC msdb.dbo.sp_add_notification @alert_name=N'Error Number 829', @operator_name=N'DBA_ALERT', @notification_method = 3;
+GO
+
