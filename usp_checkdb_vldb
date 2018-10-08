@@ -1,0 +1,227 @@
+/*************************************************************************************************************
+Break up DBCC CHECKDB for VLDB into 7 buckets which we CHECKTABLE, CHECKCATALOG, and CHECKALLOC on
+
+
+
+--https://www.sqlskills.com/blogs/paul/checkdb-from-every-angle-consistency-checking-options-for-a-vldb/
+
+From Paul:
+There’s one drawback to this method – a new internal database snapshot is created each time you start a 
+new DBCC command, even for a DBCC CHECKTABLE. If the update workload on the database is significant, 
+then there could be a lot of transaction log to recover each time the database snapshot is created,
+leading to a long total run-time. In this case, you may need to alter the number of buckets you use 
+to make the total operation fit within your available window.
+
+*************************************************************************************************************/
+
+use YourDatabase
+go
+
+--alter proc usp_checkdb_vldb(	@recomputeBuckets bit = null
+--									,@Execute char(1) = null)
+--as
+
+set nocount on;
+
+declare @recomputeBuckets bit = 0					--1 updates bucket tables. Use once a week, or biweekly
+declare @Execute char(1) = 'N'						--Y executes N prints
+
+
+
+
+declare @sql varchar(4000) = ''						--dynamic sql var for CHECKTABLE
+declare @Grp int = datepart(weekday,getdate())		--the group / bucket we are going to run based off the current day
+declare @TableName varchar(256)						--used in cursor and CHECKTABLE
+declare @DB varchar(64) = DB_NAME()					--current DB which this will be ran against
+
+
+
+-------------------------------------------------------------------------------------
+--default print the commands
+-------------------------------------------------------------------------------------
+if @Execute is null set @Execute = 'N'
+if @Execute not in ('Y','N')
+begin
+	raiserror ('Incorrect value for @Execute parameter in usp_checkdb_vldb',16,1)
+	return;
+end
+
+-------------------------------------------------------------------------------------
+--default recompute on sundays only
+-------------------------------------------------------------------------------------
+if @recomputeBuckets is null
+begin
+	if datepart(weekday,getdate()) = 1
+		set @recomputeBuckets = 1
+	else
+		set @recomputeBuckets = 0
+end
+
+
+-------------------------------------------------------------------------------------
+--Create our bucket table we will use to store info for DBCC
+-------------------------------------------------------------------------------------
+
+
+if object_id('AdminTools..TableSpace') is null
+begin
+	create table AdminTools..TableSpace(TableName varchar(256)
+										,Schem varchar(256)
+										,Pages bigint
+										,Grp int
+										,GrpPages bigint
+										,LoadDate datetime)
+end
+
+
+
+
+-------------------------------------------------------------------------------------
+--we only want to recompute the buckets once a week or so
+--if we did this every day, there could be a table that jumped buckets and thus
+--didn't get checked. So, only use @recomputeBuckets = 1 weekly, biweekly, etc.
+-------------------------------------------------------------------------------------
+
+if @recomputeBuckets = 1
+begin
+
+	-------------------------------------------------------------------------------------
+	--Get the total table size (by rowss)
+	-------------------------------------------------------------------------------------
+
+
+	if object_id('tempdb..#Space') is not null
+	drop table #Space
+
+	SELECT 
+		TableName = t.NAME,
+		Schem = s.name,
+		Pages = sum(a.total_pages),
+		Grp = row_number() over (order by sum(a.total_pages) desc)
+	INTO #Space
+	FROM 
+		sys.tables t
+	INNER JOIN      
+		sys.indexes i ON t.OBJECT_ID = i.object_id
+	INNER JOIN 
+		sys.partitions p ON i.object_id = p.OBJECT_ID AND i.index_id = p.index_id
+	INNER JOIN 
+		sys.allocation_units a ON p.partition_id = a.container_id
+	LEFT OUTER JOIN 
+		sys.schemas s ON t.schema_id = s.schema_id
+	WHERE 
+		t.NAME NOT LIKE 'dt%' 
+		AND t.is_ms_shipped = 0
+		AND i.OBJECT_ID > 255 
+	GROUP BY 
+		t.Name, s.name
+
+
+	-------------------------------------------------------------------------------------
+	--split the tables into 6 buckets by:
+		--updating the Grp to the Grp with the lowest cumulative sum of all members by
+		--ordering by the current cumulative sum of all members
+	-------------------------------------------------------------------------------------
+
+	declare @ct int = 8
+
+
+	while @ct <= (select max(Grp) from #Space)
+	begin
+
+		update S
+		set Grp = (select top 1 Grp from #Space where Grp < 8 order by sum(Pages) over (partition by Grp) asc)
+		from #Space S
+		where S.Grp = @ct
+
+		set @ct = @ct + 1
+
+	end
+
+
+	insert into AdminTools..TableSpace (TableName
+										,Schem
+										,Pages
+										,Grp
+										,GrpPages
+										,LoadDate)
+	select 
+		TableName
+		,Schem
+		,Pages
+		,Grp
+		,GrpPages = sum(Pages) over (partition by Grp)
+		,LoadDate = getdate()
+	from #Space
+end
+
+
+-------------------------------------------------------------------------------------
+--gather tables for CHECKTABLE and build the execution string
+-------------------------------------------------------------------------------------
+
+declare cur cursor local fast_forward for
+	select TableName 
+	from AdminTools..TableSpace 
+	where Grp = @Grp and LoadDate = (select max(LoadDate) from AdminTools..TableSpace)
+
+open cur
+fetch next from cur into @TableName
+
+while @@FETCH_STATUS = 0
+
+begin
+	
+	set @sql = @sql + 'DBCC CHECKTABLE (''' + @TableName + ''') WITH NO_INFOMSGS;' + char(13) 
+	fetch next from cur into @TableName
+
+end
+
+close cur
+deallocate cur
+
+
+
+-------------------------------------------------------------------------------------
+--Conduct the checks...
+-------------------------------------------------------------------------------------
+
+if @Execute = 'Y'
+begin
+	--Saturdays and Wednsdays CHECKALLOC
+	if datepart(weekday,getdate()) in (7,4)
+	begin
+		DBCC CHECKALLOC (@DB) WITH NO_INFOMSGS;
+	end
+
+	--Saturdays CHECKCATALOG
+	if datepart(weekday,getdate()) = 7
+	begin
+		DBCC CHECKCATALOG (@DB) WITH NO_INFOMSGS;
+	end
+
+	--CHECKTABLE for the tables in bucket
+	EXEC(@sql);
+end
+
+if @Execute = 'N'
+begin
+	--sundays and thursday CHECKALLOC
+	if datepart(weekday,getdate()) in (1,5)
+	begin
+		print 'DBCC CHECKALLOC (' + @DB + ') WITH NO_INFOMSGS;'
+	end
+
+	--sundays CHECKCATALOG
+	if datepart(weekday,getdate()) = 1
+	begin
+		print 'DBCC CHECKCATALOG (' + @DB + ') WITH NO_INFOMSGS;'
+	end
+
+	--CHECKTABLE for the tables in bucket
+	print @sql
+end
+
+
+
+
