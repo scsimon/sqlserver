@@ -1,3 +1,6 @@
+USE [YourDatabase]
+GO
+
 /*************************************************************************************************************
 Break up DBCC CHECKDB for VLDB into 7 buckets which we CHECKTABLE, CHECKCATALOG, and CHECKALLOC on
 
@@ -12,19 +15,26 @@ then there could be a lot of transaction log to recover each time the database s
 leading to a long total run-time. In this case, you may need to alter the number of buckets you use 
 to make the total operation fit within your available window.
 
+2018-10-08		S.Simon		Created Proc
+2018-10-20		S.Simon		Added logging
+
 *************************************************************************************************************/
 
-use YourDatabase
-go
+SET ANSI_NULLS ON
+GO
 
---alter proc usp_checkdb_vldb(	@recomputeBuckets bit = null
---									,@Execute char(1) = null)
---as
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+ALTER proc [dbo].[usp_checkdb_vldb](	@recomputeBuckets bit = null
+											,@Execute char(1) = null)
+as
 
 set nocount on;
 
-declare @recomputeBuckets bit = 0					--1 updates bucket tables. Use once a week, or biweekly
-declare @Execute char(1) = 'N'						--Y executes N prints
+--declare @recomputeBuckets bit = 0					--1 updates bucket tables. Use once a week, or biweekly
+--declare @Execute char(1) = 'N'						--Y executes N prints
 
 
 
@@ -47,11 +57,11 @@ begin
 end
 
 -------------------------------------------------------------------------------------
---default recompute on sundays only
+--default recompute on sundays only, every other week
 -------------------------------------------------------------------------------------
 if @recomputeBuckets is null
 begin
-	if datepart(weekday,getdate()) = 1
+	if datepart(weekday,getdate()) = 1 and datepart(week,getdate()) % 2 = 0
 		set @recomputeBuckets = 1
 	else
 		set @recomputeBuckets = 0
@@ -74,6 +84,37 @@ begin
 end
 
 
+-------------------------------------------------------------------------------------
+--Create logging table for DBCC results
+-------------------------------------------------------------------------------------
+if object_id('AdminTools..DBCC_History') is null
+begin 
+	create table AdminTools..DBCC_History(
+		Error bigint NULL,
+		[Level] bigint NULL,
+		[State] bigint NULL,
+		MessageText varchar(7000) NULL,
+		RepairLevel bigint NULL,
+		[Status] bigint NULL,
+		[DbId] bigint NULL,
+		DbFragId bigint NULL,
+		ObjectId bigint NULL,
+		IndexId bigint NULL,
+		PartitionID bigint NULL,
+		AllocUnitID bigint NULL,
+		RidDbId bigint NULL,
+		RidPruId bigint NULL,
+		[File] bigint NULL,
+		[Page] bigint NULL,
+		Slot bigint NULL,
+		RefDbId bigint NULL,
+		RefPruId bigint NULL,
+		RefFile bigint NULL,
+		RefPage bigint NULL,
+		RefSlot bigint NULL,
+		Allocation bigint NULL,
+		RunDate datetime null default (getdate()))
+end
 
 
 -------------------------------------------------------------------------------------
@@ -118,7 +159,7 @@ begin
 
 
 	-------------------------------------------------------------------------------------
-	--split the tables into 6 buckets by:
+	--split the tables into 7 buckets by:
 		--updating the Grp to the Grp with the lowest cumulative sum of all members by
 		--ordering by the current cumulative sum of all members
 	-------------------------------------------------------------------------------------
@@ -172,7 +213,7 @@ while @@FETCH_STATUS = 0
 
 begin
 	
-	set @sql = @sql + 'DBCC CHECKTABLE (''' + @TableName + ''') WITH NO_INFOMSGS;' + char(13) 
+	set @sql = @sql + 'DBCC CHECKTABLE (''' + @TableName + ''') WITH TABLERESULTS;' + char(13) 
 	fetch next from cur into @TableName
 
 end
@@ -191,29 +232,35 @@ begin
 	--Saturdays and Wednsdays CHECKALLOC
 	if datepart(weekday,getdate()) in (7,4)
 	begin
-		DBCC CHECKALLOC (@DB) WITH NO_INFOMSGS;
+		insert into AdminTools..DBCC_History(Error,[Level],[State],MessageText,RepairLevel,[Status],[DbId],DbFragId,ObjectId,IndexId,PartitionID,
+											AllocUnitID,RidDbId,RidPruId,[File],[Page],Slot,RefDbId,RefPruId,RefFile,RefPage,RefSlot,Allocation)
+		exec ('DBCC CHECKALLOC (' + @DB + ' ) WITH TABLERESULTS;')
 	end
 
 	--Saturdays CHECKCATALOG
 	if datepart(weekday,getdate()) = 7
 	begin
-		DBCC CHECKCATALOG (@DB) WITH NO_INFOMSGS;
+		insert into AdminTools..DBCC_History(Error,[Level],[State],MessageText,RepairLevel,[Status],[DbId],DbFragId,ObjectId,IndexId,PartitionID,
+											AllocUnitID,RidDbId,RidPruId,[File],[Page],Slot,RefDbId,RefPruId,RefFile,RefPage,RefSlot,Allocation)
+		exec ('DBCC CHECKCATALOG (' + @DB + ' ) WITH TABLERESULTS;')
 	end
 
 	--CHECKTABLE for the tables in bucket
+	insert into AdminTools..DBCC_History(Error,[Level],[State],MessageText,RepairLevel,[Status],[DbId],DbFragId,ObjectId,IndexId,PartitionID,
+											AllocUnitID,RidDbId,RidPruId,[File],[Page],Slot,RefDbId,RefPruId,RefFile,RefPage,RefSlot,Allocation)
 	EXEC(@sql);
 end
 
 if @Execute = 'N'
 begin
-	--sundays and thursday CHECKALLOC
-	if datepart(weekday,getdate()) in (1,5)
+	--Saturdays and Wednsdays CHECKALLOC
+	if datepart(weekday,getdate()) in (7,4)
 	begin
 		print 'DBCC CHECKALLOC (' + @DB + ') WITH NO_INFOMSGS;'
 	end
 
-	--sundays CHECKCATALOG
-	if datepart(weekday,getdate()) = 1
+	--Saturdays CHECKCATALOG
+	if datepart(weekday,getdate()) = 7
 	begin
 		print 'DBCC CHECKCATALOG (' + @DB + ') WITH NO_INFOMSGS;'
 	end
@@ -223,5 +270,9 @@ begin
 end
 
 
+
+
+
+GO
 
 
